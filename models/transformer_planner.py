@@ -171,3 +171,95 @@ class TransformerPlanner(nn.Module):
 
         # Project each output token to (x, y)
         return self.output_proj(out)            # (B, 50, 2)
+
+
+if __name__ == "__main__":
+    print(__doc__)
+
+    B, T_past, T_future = 2, 41, 50
+    d_model, nhead, enc_layers, dec_layers = 128, 4, 3, 3
+
+    model = TransformerPlanner(
+        past_steps=T_past, future_steps=T_future,
+        d_model=d_model, nhead=nhead,
+        enc_layers=enc_layers, dec_layers=dec_layers,
+    )
+    model.eval()
+
+    batch = {
+        "past_traj":    torch.zeros(B, T_past, 2),
+        "speed":        torch.zeros(B, T_past),
+        "acceleration": torch.zeros(B, T_past, 3),
+        "command":      torch.zeros(B, dtype=torch.long),
+    }
+
+    # ── register forward hooks on key named submodules ─────────────────────
+    log: list = []
+    handles = []
+    TRACE = {"input_proj", "encoder", "decoder", "output_proj"}
+
+    def _hook(name, mtype):
+        def fn(m, inp, out):
+            if isinstance(out, torch.Tensor):
+                log.append((name, mtype, tuple(out.shape)))
+        return fn
+
+    for name, mod in model.named_modules():
+        if name in TRACE:
+            handles.append(mod.register_forward_hook(_hook(name, type(mod).__name__)))
+
+    with torch.no_grad():
+        output = model(batch)
+
+    for h in handles:
+        h.remove()
+
+    # ── print shape table ──────────────────────────────────────────────────
+    W = 72
+
+    def _row(label, shape, note=""):
+        s = "(" + ", ".join(str(d) for d in shape) + ")"
+        note_str = f"  # {note}" if note else ""
+        print(f"  {label:<36s}  {s:<22s}{note_str}")
+
+    def _sec(title):
+        print(f"  ── {title} {'─' * max(0, W - 6 - len(title))}")
+
+    print("━" * W)
+    print(f"  TENSOR SHAPES  ·  TransformerPlanner  ·  B={B}  d_model={d_model}  "
+          f"enc={enc_layers}  dec={dec_layers}")
+    print("━" * W)
+
+    _sec("inputs")
+    _row("past_traj",    batch["past_traj"].shape)
+    _row("speed",        batch["speed"].shape)
+    _row("acceleration", batch["acceleration"].shape)
+    _row("command",      batch["command"].shape)
+
+    _sec("tokenisation  →  (B, T_past, 7)  per-step feature vector")
+    _row("tokens  [cat: xy, speed, accel, cmd]", (B, T_past, 7))
+
+    stage_notes = {
+        "input_proj":  "Linear(7 → d_model)  +  sin-cos pos enc",
+        "encoder":     f"memory  —  {enc_layers} × (self-attn + FFN)  pre-LN",
+        "decoder":     f"{dec_layers} × (self-attn + cross-attn + FFN)  pre-LN",
+        "output_proj": "Linear(d_model → 2)",
+    }
+    stage_labels = {
+        "input_proj":  "input_proj  [Linear]",
+        "encoder":     "encoder  [TransformerEncoder]",
+        "decoder":     "decoder  [TransformerDecoder]",
+        "output_proj": "output_proj  [Linear]",
+    }
+
+    _sec("model stages")
+    _row(f"query_embed  [Embedding]",
+         (T_future, d_model), "learned, expanded to (B, T_future, d_model)")
+    for name, mtype, shape in log:
+        _row(stage_labels.get(name, f"{name}  [{mtype}]"), shape,
+             stage_notes.get(name, ""))
+
+    _sec("output")
+    _row("future_traj", tuple(output.shape))
+    print("━" * W)
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")

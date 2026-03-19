@@ -64,6 +64,17 @@ def build_model(args):
             ffn_dim=args.token_dim * 4,
             multiscale=args.multiscale,
             front_cam_only=args.front_cam_only,
+            debug=args.debug,
+        )
+    elif args.model == "front_cam":
+        from models.front_cam_planner import FrontCamPlanner
+        return FrontCamPlanner(
+            token_dim=args.token_dim,
+            num_heads=args.nhead,
+            enc_layers=args.enc_layers,
+            dec_layers=args.dec_layers,
+            multiscale=args.multiscale,
+            debug=args.debug,
         )
     else:
         raise ValueError(f"Unknown model: {args.model!r}. "
@@ -83,24 +94,44 @@ def build_dataloaders(args):
             load_semantic=True,
             front_cam_only=args.front_cam_only,
         )
+    elif args.model == "front_cam":
+        ds_kwargs = dict(
+            load_images=True,
+            image_size=(224, 224),
+            load_depth=False,
+            load_semantic=False,
+            front_cam_only=True,
+        )
     else:
         ds_kwargs = dict(load_images=False, image_size=None)
 
-    train_ds, val_ds = make_datasets(root=args.data_root, **ds_kwargs)
+    train_ds, _inner_val = make_datasets(root=args.data_root, **ds_kwargs)
+
+    val_root = args.val_data_root or args.data_root
+    if val_root != args.data_root:
+        # Validate on a separate dataset (all scenarios used for val)
+        val_ds = Bench2DriveDataset(root=val_root, **ds_kwargs)
+    else:
+        val_ds = _inner_val
+
     train_dl = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=True,
     )
     val_dl = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
         pin_memory=True,
+        persistent_workers=True,
     )
     return train_dl, val_dl
 
@@ -113,14 +144,18 @@ def main():
     parser = argparse.ArgumentParser(description="Train an E2E driving model on bench2drive.")
 
     # Data
-    parser.add_argument("--data_root",   default="/workspace/bench2drive_mini",
-                        help="Path to bench2drive_mini dataset root")
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--batch_size",  type=int, default=32)
+    parser.add_argument("--data_root",     default="/workspace/bench2resize",
+                        help="Path to training dataset root")
+    parser.add_argument("--val_data_root", default="/workspace/bench2drive_mini",
+                        help="Path to validation dataset root (default: bench2drive_mini). "
+                             "Set to '' to val on a held-out split of --data_root instead.")
+    parser.add_argument("--num_workers",     type=int, default=16)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--batch_size",      type=int, default=128)
 
     # Model
     parser.add_argument("--model",       default="mlp",
-                        choices=["mlp", "transformer", "vision_transformer"],
+                        choices=["mlp", "transformer", "vision_transformer", "front_cam"],
                         help="Model architecture to train")
     parser.add_argument("--hidden_dim",  type=int, default=256,
                         help="[mlp] hidden layer width")
@@ -151,6 +186,16 @@ def main():
                         help="[vision_transformer] use only TinyViT bottom level")
     parser.add_argument("--front_cam_only", action="store_true", default=False,
                         help="[vision_transformer] use only front camera")
+
+    # Debug
+    parser.add_argument("--debug", action="store_true", default=False,
+                        help="Debug mode: print tensor shapes at vital stages and run only a few steps")
+
+    # Loss
+    parser.add_argument("--traj_loss",   default="l1", choices=["l1", "l2"],
+                        help="Trajectory training loss. "
+                             "'l1' = L1 imitation over all 50 steps (SOTA: VAD/UniAD/SparseDrive). "
+                             "'l2' = avg L2 at 1s/2s/3s horizons only (legacy).")
 
     # Optimiser
     parser.add_argument("--lr",           type=float, default=1e-3)
@@ -186,13 +231,15 @@ def main():
             viz_samples=args.viz_samples,
             depth_weight=args.depth_weight,
             sem_weight=args.sem_weight,
+            traj_loss=args.traj_loss,
         )
     else:
-        module = E2EDrivingModule(
+        module = E2EDrivingModule(  # front_cam and other models use E2EDrivingModule
             model=model,
             lr=args.lr,
             weight_decay=args.weight_decay,
             viz_samples=args.viz_samples,
+            traj_loss=args.traj_loss,
         )
     train_dl, val_dl = build_dataloaders(args)
 
@@ -213,20 +260,27 @@ def main():
 
     # ── trainer ───────────────────────────────────────────────────────────
     trainer = pl.Trainer(
-        max_epochs=args.epochs,
+        max_epochs=1 if args.debug else args.epochs,
+        limit_train_batches=5 if args.debug else 1.0,
+        limit_val_batches=2 if args.debug else 1.0,
         devices=args.devices,
         accelerator="auto",
         precision=args.precision,
         logger=logger,
         callbacks=callbacks,
-        log_every_n_steps=10,
+        log_every_n_steps=1 if args.debug else 10,
         val_check_interval=1.0,
+        gradient_clip_val=1.0,
     )
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel : {args.model}  ({n_params:,} params)")
-    print(f"Train : {len(train_dl.dataset)} samples   Val: {len(val_dl.dataset)} samples")
-    print(f"Logs  : {logger.log_dir}\n")
+    print(f"Train : {len(train_dl.dataset)} samples  ({args.data_root})")
+    print(f"Val   : {len(val_dl.dataset)} samples  ({args.val_data_root or args.data_root})")
+    print(f"Logs  : {logger.log_dir}")
+    if args.debug:
+        print("[DEBUG] Debug mode enabled — 5 train batches, 2 val batches, 1 epoch, tensor shapes printed")
+    print()
 
     trainer.fit(module, train_dl, val_dl, ckpt_path=args.ckpt_path)
 

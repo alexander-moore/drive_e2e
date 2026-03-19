@@ -1,12 +1,57 @@
 """
 VisionTransformerPlanner — Multimodal E2E driving planner.
 
-Combines TinyViT visual backbone with kinematic encoder memory.
-Three learned token sets: drive (50), depth (28×28 or 7×7), seg (28×28 or 7×7).
+Combines a frozen TinyViT visual backbone with a kinematic transformer encoder.
+Three parallel token stacks — drive (50 tokens), depth (N_q tokens per camera),
+and semantic segmentation (N_q tokens per camera) — each decoded by stacked
+FlexDecoder layers that cross-attend to visual features at multiple scales plus
+(for drive) the kinematic memory.
 
-Drive tokens cross-attend to all cameras' visual features + kinematic memory.
-Depth/seg tokens cross-attend to per-camera visual features for dense prediction.
-Auxiliary SILog (depth) and CE+Dice (semantic) losses are computed during training.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARCHITECTURE  (multiscale=True, C=6 cameras, token_dim D=256)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  INPUTS
+  images        (B, C, 3, 224, 224)    C = 6  (or 1 if front_cam_only)
+  past_traj     (B, 41, 2)  ─┐
+  speed         (B, 41)     ─┤─ concat per-step → (B, 41, 7)
+  acceleration  (B, 41, 3)  ─┤
+  command       (B,)        ─┘
+
+  ┌──────────────────────────────┐    ┌──────────────────────────────────────┐
+  │  KinematicEncoder            │    │  TinyViT  (frozen)                   │
+  │  Linear(7 → D)               │    │  in:  (B*C, 3, 224, 224)             │
+  │  + 1D sin-cos pos enc        │    │  out: 4 feature pyramid scales:      │
+  │  TransformerEncoder (pre-LN) │    │    s0: (B*C,  96, 56, 56)  3136 tok  │
+  │  enc_layers layers           │    │    s1: (B*C, 192, 28, 28)   784 tok  │
+  │  ──────────────────────────  │    │    s2: (B*C, 384, 14, 14)   196 tok  │
+  │  kin_mem  (B, 41, D)         │    │    s3: (B*C, 576,  7,  7)    49 tok  │
+  └──────────────┬───────────────┘    └──────────────┬───────────────────────┘
+                 │                                   │  vis_projs[k]: Linear(C_k → D)
+                 │                                   │
+                 │                    enc_feats_cam:  4 × (B*C, N_k, D)
+                 │                                   │
+         ┌───────┴──────────────────────────┬────────┤
+         │                                  │        │
+         ▼  per-camera only                 ▼        ▼  all cameras merged
+  ┌──────────────────────┐  ┌──────────────────────┐  ┌────────────────────────────────┐
+  │  Depth decoder       │  │  Seg decoder         │  │  Drive decoder                 │
+  │  init: depth_tokens  │  │  init: seg_tokens    │  │  init: drive_embed  (B, 50, D) │
+  │  (B*C, N_q, D)       │  │  (B*C, N_q, D)       │  │  enc sources:                  │
+  │  N_q = 784  (28×28)  │  │  N_q = 784  (28×28)  │  │    vis: (B, C*N_k, D) × 4 sc.  │
+  │  dec_layers ×        │  │  dec_layers ×        │  │    kin:  (B, 41, D)            │
+  │  FlexDecoder         │  │  FlexDecoder         │  │  dec_layers × FlexDecoder      │
+  │    cross-attn:       │  │    cross-attn:       │  │    cross-attn: vis × 4 + kin   │
+  │    vis × 4 scales    │  │    vis × 4 scales    │  └──────────────┬─────────────────┘
+  │  TokenCNNHead (×8↑)  │  │  TokenCNNHead (×8↑)  │                 │
+  └──────────┬───────────┘  └──────────┬───────────┘          Linear(D → 2)
+             │                         │                              │
+  depth (B,C,1,224,224)   semantic (B,C,28,224,224)        future_traj (B, 50, 2)
+
+  FlexDecoder layer (pre-norm):
+    tokens = tokens + SelfAttn( LN(tokens) + token_pos )
+    tokens = tokens + Σ_k CrossAttn_k( LN(tokens) + token_pos,  enc_feats[k] )
+    tokens = tokens + FFN( LN(tokens) )
 """
 
 import math
@@ -21,6 +66,25 @@ from ._blocks import make_2d_sincos_pos_enc
 
 
 NUM_SEM_CLASSES = 28  # CARLA semantic class IDs 0-27 (R channel of instance PNGs)
+
+_DBG_W = 74  # width of debug shape table
+
+
+def _dbg_header(title: str) -> None:
+    print("━" * _DBG_W)
+    print(f"  {title}")
+    print("━" * _DBG_W)
+
+
+def _dbg_sec(title: str) -> None:
+    pad = max(0, _DBG_W - 6 - len(title))
+    print(f"  ── {title} {'─' * pad}")
+
+
+def _dbg_row(label: str, t: Tensor, note: str = "") -> None:
+    shape = "(" + ", ".join(str(d) for d in t.shape) + ")"
+    note_str = f"  # {note}" if note else ""
+    print(f"  {label:<40s}  {shape:<20s}{note_str}")
 
 
 def _make_1d_sincos_pos_enc(n: int, dim: int) -> Tensor:
@@ -184,12 +248,14 @@ class VisionTransformerPlanner(nn.Module):
         ffn_dim: int = 1024,
         multiscale: bool = True,
         front_cam_only: bool = False,
+        debug: bool = False,
     ):
         super().__init__()
         D = token_dim
         self.token_dim = D
         self.multiscale = multiscale
         self.num_cams = 1 if front_cam_only else 6
+        self.debug = debug
 
         # ── Visual scale configuration ────────────────────────────────────────
         if multiscale:
@@ -303,16 +369,43 @@ class VisionTransformerPlanner(nn.Module):
         return out_flat.view(B, C, out_ch, 224, 224)
 
     def forward(self, batch: dict) -> dict:
+        dbg = self.debug
+
         # ── Kinematic encoding ────────────────────────────────────────────────
+        if dbg:
+            D = self.token_dim
+            _dbg_header(f"TENSOR SHAPES  ·  VisionTransformerPlanner  ·  "
+                        f"B={batch['past_traj'].shape[0]}  C={self.num_cams}  D={D}")
+            _dbg_sec("inputs")
+            _dbg_row("past_traj",    batch["past_traj"])
+            _dbg_row("speed",        batch["speed"])
+            _dbg_row("acceleration", batch["acceleration"])
+            _dbg_row("command",      batch["command"])
+
         kin_mem = self.kin_encoder(batch)   # (B, 41, D)
         B = kin_mem.shape[0]
+
+        if dbg:
+            _dbg_sec("kinematic encoding")
+            _dbg_row("kin_mem", kin_mem, "B, past_steps, D")
 
         # ── Visual encoding ───────────────────────────────────────────────────
         C = self.num_cams
         imgs = batch["images"][:, :C]       # (B, C, 3, 224, 224)
         imgs_flat = imgs.flatten(0, 1)      # (B*C, 3, 224, 224)
 
+        if dbg:
+            _dbg_sec("visual encoding  (TinyViT frozen  →  project each scale to D)")
+            _dbg_row("images",    imgs,      "B, C, 3, H, W")
+            _dbg_row("imgs_flat", imgs_flat, "B*C, 3, H, W")
+
         enc_feats_cam = self._encode_visual(imgs_flat)      # list of (B*C, N_k, D)
+
+        if dbg:
+            for k, feat in enumerate(enc_feats_cam):
+                H, W = self._vis_shapes[k]
+                _dbg_row(f"enc_feats_cam[{k}]  ({H}×{W} → {H*W} tok)", feat,
+                         f"scale {k}  (B*C, N_k, D)")
 
         # Multi-camera feats for drive: concat cameras along seq dim
         enc_feats_drive = []
@@ -321,6 +414,12 @@ class VisionTransformerPlanner(nn.Module):
             feat_mc = feat.reshape(B, C, -1, self.token_dim).flatten(1, 2)
             enc_feats_drive.append(feat_mc)
         enc_feats_drive.append(kin_mem)     # (B, 41, D)
+
+        if dbg:
+            _dbg_sec("drive decoder inputs  (cameras merged along seq dim  +  kin_mem)")
+            for k, feat in enumerate(enc_feats_drive):
+                label = "kin_mem" if k == len(enc_feats_drive) - 1 else f"vis_scale_{k}"
+                _dbg_row(f"enc_feats_drive[{k}]  {label}", feat, "B, C*N_k, D" if k < len(enc_feats_drive)-1 else "B, past_steps, D")
 
         # Positional encodings for drive decoder
         enc_pos_drive = [
@@ -333,10 +432,22 @@ class VisionTransformerPlanner(nn.Module):
         drive_tokens = self.drive_embed.weight.unsqueeze(0).expand(B, -1, -1)
         drive_pos = self.drive_pos          # (1, 50, D)
 
+        if dbg:
+            _dbg_sec(f"drive decoder  ({len(self.drive_decoder)} × FlexDecoder  "
+                     f"self-attn + cross-attn × {len(enc_feats_drive)} srcs + FFN)")
+            _dbg_row("drive_tokens  (init)", drive_tokens, "B, future_steps, D")
+
         for layer in self.drive_decoder:
             drive_tokens = layer(drive_tokens, enc_feats_drive, drive_pos, enc_pos_drive)
 
+        if dbg:
+            _dbg_row("drive_tokens  (decoded)", drive_tokens)
+
         future_traj = self.drive_head(drive_tokens)         # (B, 50, 2)
+
+        if dbg:
+            _dbg_row("future_traj", future_traj, "B, future_steps, 2")
+
         out = {"future_traj": future_traj}
 
         # ── Auxiliary decodes (only when labels are in batch) ─────────────────
@@ -345,11 +456,55 @@ class VisionTransformerPlanner(nn.Module):
                 B, C, enc_feats_cam,
                 self.depth_tokens, self.depth_decoder, self.depth_head,
             )
+            if dbg:
+                _dbg_sec(f"auxiliary outputs")
+                _dbg_row("depth", out["depth"], "B, C, 1, H, W")
 
         if "semantic" in batch:
             out["semantic"] = self._decode_aux(
                 B, C, enc_feats_cam,
                 self.seg_tokens, self.seg_decoder, self.seg_head,
             )
+            if dbg:
+                label = "depth" not in batch  # only print section header once
+                if label:
+                    _dbg_sec("auxiliary outputs")
+                _dbg_row("semantic", out["semantic"], "B, C, num_classes, H, W")
+
+        if dbg:
+            print("━" * _DBG_W)
+            print(f"  Parameters: {sum(p.numel() for p in self.parameters()):,}")
 
         return out
+
+
+if __name__ == "__main__":
+    print(__doc__)
+
+    B, C = 2, 6          # batch size, cameras
+    token_dim = 256
+
+    model = VisionTransformerPlanner(
+        token_dim=token_dim,
+        num_heads=8,
+        enc_layers=3,
+        dec_layers=4,
+        multiscale=True,
+        front_cam_only=False,
+        debug=True,
+    )
+    model.eval()
+
+    batch = {
+        "past_traj":    torch.zeros(B, 41, 2),
+        "speed":        torch.zeros(B, 41),
+        "acceleration": torch.zeros(B, 41, 3),
+        "command":      torch.zeros(B, dtype=torch.long),
+        "images":       torch.zeros(B, C, 3, 224, 224),
+        # Include dummy depth + semantic so auxiliary decoders run
+        "depth":        torch.zeros(B, C, 1, 224, 224),
+        "semantic":     torch.zeros(B, C, 224, 224, dtype=torch.long),
+    }
+
+    with torch.no_grad():
+        _ = model(batch)

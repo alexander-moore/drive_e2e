@@ -22,9 +22,9 @@ from torchmetrics.classification import MulticlassJaccardIndex, MulticlassAccura
 
 from visualization import plot_trajectory, plot_trajectory_batch
 try:
-    from losses import SILogLoss, DiceLoss, abs_rel        # when run from e2e/ dir
+    from losses import SILogLoss, DiceLoss, abs_rel, imitation_l1        # when run from e2e/ dir
 except ImportError:
-    from e2e.losses import SILogLoss, DiceLoss, abs_rel   # when imported as e2e package
+    from e2e.losses import SILogLoss, DiceLoss, abs_rel, imitation_l1   # when imported as e2e package
 
 
 # ---------------------------------------------------------------------------
@@ -62,8 +62,45 @@ def l2_at_horizon(pred: torch.Tensor, gt: torch.Tensor, t: int) -> torch.Tensor:
 
 
 def avg_l2(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-    """Mean L2 across the standard 1 s / 2 s / 3 s horizons."""
+    """Mean L2 across the standard 1 s / 2 s / 3 s horizons.
+
+    This is the primary *evaluation* metric used across SOTA papers
+    (UniAD, VAD, SparseDrive) and is kept for checkpoint monitoring and
+    cross-paper comparison.  It is NOT used as the training loss because it
+    only supervises 3 of the 50 future timesteps — use imitation_l1 instead.
+    """
     return torch.stack([l2_at_horizon(pred, gt, t) for t in HORIZONS.values()]).mean()
+
+
+def ade(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Average Displacement Error: mean L2 over all future timesteps.
+
+    Complements avg_l2 (which samples 3 fixed horizons) with a summary over
+    the full trajectory.  Reported alongside FDE in motion-prediction literature
+    (Argoverse, nuScenes, etc.) and increasingly in E2E planners.
+
+    Args:
+        pred: (B, T, 2)
+        gt:   (B, T, 2)
+    Returns:
+        scalar tensor [metres]
+    """
+    return torch.norm(pred - gt, dim=-1).mean()
+
+
+def fde(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Final Displacement Error: L2 at the last future timestep.
+
+    Measures how far off the endpoint (5 s ahead at 10 Hz) the planner is.
+    Reported as a standard metric in nuScenes, Argoverse, and UniAD.
+
+    Args:
+        pred: (B, T, 2)
+        gt:   (B, T, 2)
+    Returns:
+        scalar tensor [metres]
+    """
+    return torch.norm(pred[:, -1] - gt[:, -1], dim=-1).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +122,11 @@ class E2EDrivingModule(pl.LightningModule):
         lr:           Base learning rate.
         weight_decay: AdamW weight decay.
         viz_samples:  Number of samples to plot when a new best is reached.
+        traj_loss:    Training loss for the trajectory head.
+                      "l1"  — L1 imitation over all T timesteps (SOTA default,
+                              matches VAD / UniAD / SparseDrive).
+                      "l2"  — avg_l2 at the 3 evaluation horizons (legacy;
+                              supervises only 3 of 50 steps).
     """
 
     def __init__(
@@ -93,12 +135,16 @@ class E2EDrivingModule(pl.LightningModule):
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
         viz_samples: int = 4,
+        traj_loss: str = "l1",
     ):
+        if traj_loss not in ("l1", "l2"):
+            raise ValueError(f"traj_loss must be 'l1' or 'l2', got {traj_loss!r}")
         super().__init__()
         self.model = model
         self.lr = lr
         self.weight_decay = weight_decay
         self.viz_samples = viz_samples
+        self.traj_loss = traj_loss
 
         self._best_avg_l2: float = float("inf")
         self._viz_buffer: list[dict] = []
@@ -114,14 +160,29 @@ class E2EDrivingModule(pl.LightningModule):
         pred = self(batch)          # (B, T, 2)
         gt   = batch["future_traj"] # (B, T, 2)
 
-        # Training loss: avg L2 across horizons (same scale as val metric)
-        loss = avg_l2(pred, gt)
+        # Training loss.
+        # "l1"  — L1 imitation over all T future timesteps (SOTA: VAD, UniAD, SparseDrive).
+        #         Supervises every waypoint uniformly; L1 is more robust to outliers than L2.
+        # "l2"  — avg L2 at the 3 horizon checkpoints only (legacy; 3 of 50 steps supervised).
+        if self.traj_loss == "l1":
+            loss = imitation_l1(pred, gt)
+        else:
+            loss = avg_l2(pred, gt)
+
+        # Evaluation metrics (logged every epoch regardless of training loss).
+        # avg_l2 is the primary checkpoint metric for cross-paper comparison.
+        # ADE/FDE are standard motion-prediction metrics (nuScenes, Argoverse, UniAD).
+        l2_metric = avg_l2(pred, gt)
 
         on_step = stage == "train"
-        self.log(f"{stage}/loss",     loss, on_step=on_step, on_epoch=True,
+        self.log(f"{stage}/loss",     loss,      on_step=on_step, on_epoch=True,
                  prog_bar=True,  sync_dist=True)
-        self.log(f"{stage}/avg_l2",   loss, on_step=False,   on_epoch=True,
+        self.log(f"{stage}/avg_l2",   l2_metric, on_step=False,   on_epoch=True,
                  prog_bar=True,  sync_dist=True)
+        self.log(f"{stage}/ade",      ade(pred, gt), on_step=False, on_epoch=True,
+                 prog_bar=False, sync_dist=True)
+        self.log(f"{stage}/fde",      fde(pred, gt), on_step=False, on_epoch=True,
+                 prog_bar=False, sync_dist=True)
 
         for name, t in HORIZONS.items():
             self.log(f"{stage}/l2_{name}", l2_at_horizon(pred, gt, t),
@@ -174,21 +235,24 @@ class E2EDrivingModule(pl.LightningModule):
         viz_dir = log_dir / "best_trajectories"
         viz_dir.mkdir(parents=True, exist_ok=True)
 
-        for i, s in enumerate(self._viz_buffer):
-            title = f"best  epoch {self.current_epoch}  {s['scenario']}  frame {s['anchor_idx']}"
+        for s in self._viz_buffer:
+            scene = s["scenario"] or f"frame{s['anchor_idx']}"
+            title = f"best  epoch {self.current_epoch}  {scene}  frame {s['anchor_idx']}"
             plot_trajectory(
                 past_traj=s["past_traj"].numpy(),
                 future_traj_gt=s["future_traj"].numpy(),
                 future_traj_pred=s["pred_traj"].numpy(),
                 title=title,
-                save_path=str(viz_dir / f"sample{i:02d}.png"),
+                save_path=str(viz_dir / f"{scene}.png"),
             )
 
         # Also save a batch grid
+        scene_titles = [s["scenario"] or f"frame{s['anchor_idx']}" for s in self._viz_buffer]
         plot_trajectory_batch(
             past_trajs=torch.stack([s["past_traj"]   for s in self._viz_buffer]).numpy(),
             future_trajs_gt=torch.stack([s["future_traj"] for s in self._viz_buffer]).numpy(),
             future_trajs_pred=torch.stack([s["pred_traj"]  for s in self._viz_buffer]).numpy(),
+            titles=scene_titles,
             save_path=str(viz_dir / "grid.png"),
         )
 
@@ -238,8 +302,9 @@ class MultiTaskE2EModule(E2EDrivingModule):
         viz_samples: int = 4,
         depth_weight: float = 0.1,
         sem_weight: float = 0.1,
+        traj_loss: str = "l1",
     ):
-        super().__init__(model, lr, weight_decay, viz_samples)
+        super().__init__(model, lr, weight_decay, viz_samples, traj_loss)
         self.depth_weight = depth_weight
         self.sem_weight = sem_weight
 
@@ -258,7 +323,11 @@ class MultiTaskE2EModule(E2EDrivingModule):
         pred_traj = output["future_traj"]   # (B, 50, 2)
         gt_traj = batch["future_traj"]      # (B, 50, 2)
 
-        loss_traj = avg_l2(pred_traj, gt_traj)
+        # Trajectory training loss — same choice as the base module.
+        if self.traj_loss == "l1":
+            loss_traj = imitation_l1(pred_traj, gt_traj)
+        else:
+            loss_traj = avg_l2(pred_traj, gt_traj)
         loss = loss_traj
 
         on_step = stage == "train"
@@ -285,13 +354,21 @@ class MultiTaskE2EModule(E2EDrivingModule):
             loss_sem = loss_ce + 0.5 * loss_dice
             loss = loss + self.sem_weight * loss_sem
 
+        # Evaluation metrics are always computed from avg_l2 / ADE / FDE regardless
+        # of which training loss was selected, so val/avg_l2 remains comparable across runs.
+        l2_metric = avg_l2(pred_traj, gt_traj)
+
         self.log(f"{stage}/loss",       loss,       on_step=on_step, on_epoch=True,
                  prog_bar=True, sync_dist=True)
         self.log(f"{stage}/loss_traj",  loss_traj,  on_step=False, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/loss_depth", loss_depth, on_step=False, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/loss_sem",   loss_sem,   on_step=False, on_epoch=True, sync_dist=True)
-        self.log(f"{stage}/avg_l2",     loss_traj,  on_step=False, on_epoch=True,
+        self.log(f"{stage}/avg_l2",     l2_metric,  on_step=False, on_epoch=True,
                  prog_bar=True, sync_dist=True)
+        self.log(f"{stage}/ade",        ade(pred_traj, gt_traj), on_step=False, on_epoch=True,
+                 prog_bar=False, sync_dist=True)
+        self.log(f"{stage}/fde",        fde(pred_traj, gt_traj), on_step=False, on_epoch=True,
+                 prog_bar=False, sync_dist=True)
 
         for name, t in HORIZONS.items():
             self.log(f"{stage}/l2_{name}", l2_at_horizon(pred_traj, gt_traj, t),

@@ -20,6 +20,7 @@ Coordinate convention (ego frame):
 
 import gzip
 import json
+import math
 import os
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -131,7 +132,7 @@ class Bench2DriveDataset(Dataset):
 
     def _load_depth_label(self, scenario_path: Path, cam_suffix: str, frame_idx: int) -> torch.Tensor:
         """Load depth label as float32 tensor (1, H, W)."""
-        img_path = scenario_path / f"depth_{cam_suffix}" / f"{frame_idx:05d}.png"
+        img_path = scenario_path / "camera" / f"depth_{cam_suffix}" / f"{frame_idx:05d}.png"
         img = Image.open(img_path)
         if self.image_size is not None:
             img = img.resize((self.image_size[1], self.image_size[0]), Image.BILINEAR)
@@ -142,7 +143,7 @@ class Bench2DriveDataset(Dataset):
 
     def _load_semantic_label(self, scenario_path: Path, cam_suffix: str, frame_idx: int) -> torch.Tensor:
         """Load semantic label from instance PNG R-channel as int64 tensor (H, W)."""
-        img_path = scenario_path / f"instance_{cam_suffix}" / f"{frame_idx:05d}.png"
+        img_path = scenario_path / "camera" / f"instance_{cam_suffix}" / f"{frame_idx:05d}.png"
         img = Image.open(img_path).convert("RGBA")
         if self.image_size is not None:
             img = img.resize((self.image_size[1], self.image_size[0]), Image.NEAREST)
@@ -165,6 +166,12 @@ class Bench2DriveDataset(Dataset):
         # ── anchor frame (current timestep) ──────────────────────────────────
         anchor = self._load_anno(scenario_path, anchor_idx)
         x0, y0, theta0 = anchor["x"], anchor["y"], anchor["theta"]
+
+        # Guard: a small number of frames have theta=nan (CARLA recording artefact).
+        # theta is the anchor heading used to rotate all waypoints into ego frame —
+        # there is no meaningful fallback, so skip to the next sample instead.
+        if not math.isfinite(theta0):
+            return self[(idx + 1) % len(self)]
 
         # ── past trajectory (indices anchor-PAST_STEPS .. anchor, inclusive) ─
         past_world = np.array(

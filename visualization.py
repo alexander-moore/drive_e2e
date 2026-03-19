@@ -60,9 +60,9 @@ def plot_trajectory(
         ax.plot(future_traj_pred[:, 1], future_traj_pred[:, 0],
                 color="tomato", alpha=0.5, linewidth=1, zorder=2)
 
-    # Anchor marker + heading arrow
+    # Anchor marker + heading arrow (forward = +x ego = up on plot)
     ax.scatter(0, 0, color="black", s=80, marker="*", zorder=5)
-    ax.annotate("", xy=(2, 0), xytext=(0, 0),
+    ax.annotate("", xy=(0, 2), xytext=(0, 0),
                 arrowprops=dict(arrowstyle="->", color="black", lw=1.5))
 
     legend_items = [
@@ -96,6 +96,7 @@ def plot_trajectory_batch(
     past_trajs: np.ndarray,
     future_trajs_gt: np.ndarray,
     future_trajs_pred: np.ndarray | None = None,
+    titles: list[str] | None = None,
     max_cols: int = 4,
     save_path: str | None = None,
     show: bool = False,
@@ -145,7 +146,8 @@ def plot_trajectory_batch(
         ax.scatter(0, 0, color="black", s=60, marker="*")
         ax.set_aspect("equal")
         ax.grid(True, alpha=0.3)
-        ax.set_title(f"sample {idx}", fontsize=7)
+        label = titles[idx] if titles and idx < len(titles) else f"sample {idx}"
+        ax.set_title(label, fontsize=7)
         ax.tick_params(labelsize=6)
 
     plt.tight_layout()
