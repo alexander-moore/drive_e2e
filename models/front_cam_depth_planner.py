@@ -1,9 +1,11 @@
 """
-FrontCamPlanner — Single front-camera ablation planner.
+FrontCamDepthPlanner — Single front-camera planner with depth auxiliary head.
 
-Ablation model answering: "how much does a single front camera help over
-kinematics alone?"  Uses one camera instead of six, no depth/semantic
-auxiliary heads — plugs directly into E2EDrivingModule.
+Extends FrontCamPlanner with a depth prediction auxiliary task to test whether
+forcing better visual feature learning via depth supervision improves trajectory
+prediction. Uses only the front camera (C=1); no semantic head.
+
+Use with MultiTaskE2EModule (sem_weight=0.0).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ARCHITECTURE  (multiscale=False default, token_dim D=128)
@@ -31,21 +33,25 @@ ARCHITECTURE  (multiscale=False default, token_dim D=128)
                  │                                   │  + 2D sin-cos pos enc per scale
                  │                    enc_feats:  list of (B, N_k, D)
                  │                                   │
-                 └──────────────────────────────┬────┘
-                                                │
-                                     ┌──────────┴──────────────────────────┐
-                                     │  Drive decoder                      │
-                                     │  init: drive_embed  (B, 50, D)      │
-                                     │  enc sources:                        │
-                                     │    vis: (B, N_k, D) × num_vis_levels │
-                                     │    kin: (B, 41, D)                   │
-                                     │  dec_layers × FlexDecoderLayer       │
-                                     │    cross-attn: vis × levels + kin    │
-                                     └──────────────┬──────────────────────┘
-                                                    │
-                                             Linear(D → 2)
-                                                    │
-                                        future_traj (B, 50, 2)
+         ┌───────┴──────────────────────────┬────────┘
+         │                                  │
+         ▼  visual only                     ▼  vis + kin
+  ┌──────────────────────┐  ┌────────────────────────────────┐
+  │  Depth decoder       │  │  Drive decoder                 │
+  │  init: depth_tokens  │  │  init: drive_embed  (B, 50, D) │
+  │  (B, N_q, D)         │  │  enc sources:                  │
+  │  multiscale=False:   │  │    vis: (B, N_k, D) × 1 scale  │
+  │    N_q=49  (7×7)     │  │    kin:  (B, 41, D)            │
+  │  multiscale=True:    │  │  dec_layers × FlexDecoderLayer │
+  │    N_q=784 (28×28)   │  │    cross-attn: vis × levels    │
+  │  dec_layers ×        │  │                      + kin     │
+  │  FlexDecoder         │  └──────────────┬─────────────────┘
+  │    cross-attn:       │                 │
+  │    vis × levels      │          Linear(D → 2)
+  │  TokenCNNHead (↑)    │                 │
+  └──────────┬───────────┘      future_traj (B, 50, 2)
+             │
+  depth (B, 1, 1, 224, 224)   ← unsqueeze cam dim for MultiTaskE2EModule
 
   FlexDecoder layer (pre-norm):
     tokens = tokens + SelfAttn( LN(tokens) + token_pos )
@@ -60,6 +66,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from ._tinyvit import TinyViTEncoder
+from ._transformer import TokenCNNHead
 from ._blocks import make_2d_sincos_pos_enc
 from .vision_transformer_planner import (
     KinematicEncoder,
@@ -72,19 +79,21 @@ from .vision_transformer_planner import (
 )
 
 
-class FrontCamPlanner(nn.Module):
+class FrontCamDepthPlanner(nn.Module):
     """
-    Single front-camera ablation planner.
+    Single front-camera planner with depth auxiliary head.
 
-    Fuses a frozen TinyViT visual backbone (front camera only) with a
-    kinematic transformer encoder to predict future trajectories.
-    No auxiliary depth or semantic heads — use with E2EDrivingModule.
+    Extends FrontCamPlanner with a depth prediction head that cross-attends
+    to visual features only (no kinematic memory), matching the architecture
+    of VisionTransformerPlanner's depth decoder.
+
+    Use with MultiTaskE2EModule (sem_weight=0.0 to disable semantic loss).
 
     Args:
         token_dim:   token / model dimensionality D (default 128)
         num_heads:   attention heads (default 4)
         enc_layers:  kinematic encoder layers (default 2)
-        dec_layers:  drive decoder layers (default 3)
+        dec_layers:  decoder layers for both drive and depth stacks (default 3)
         ffn_dim:     FFN hidden dim (defaults to token_dim * 4)
         multiscale:  if True, use all 4 TinyViT scales; if False, bottom-only
         debug:       if True, print tensor shapes during forward pass
@@ -112,10 +121,14 @@ class FrontCamPlanner(nn.Module):
             self.num_vis_levels = 4
             self._vis_shapes = [(56, 56), (28, 28), (14, 14), (7, 7)]
             self._vis_chans = [96, 192, 384, 576]
+            self.n_q = 28 * 28       # 784 depth tokens
+            self.token_stride = 8    # 28×28 → stride 8 → 224
         else:
             self.num_vis_levels = 1
             self._vis_shapes = [(7, 7)]
             self._vis_chans = [576]
+            self.n_q = 7 * 7         # 49 depth tokens
+            self.token_stride = 32   # 7×7 → stride 32 → 224
 
         # ── TinyViT encoder (frozen) ──────────────────────────────────────────
         self.encoder = TinyViTEncoder(img_h=224, img_w=224)
@@ -136,6 +149,10 @@ class FrontCamPlanner(nn.Module):
         self.register_buffer("kin_pos",   _make_1d_sincos_pos_enc(41, D))  # (1, 41, D)
         self.register_buffer("drive_pos", _make_1d_sincos_pos_enc(50, D))  # (1, 50, D)
 
+        H_q = W_q = int(math.sqrt(self.n_q))
+        aux_pe = make_2d_sincos_pos_enc(H_q, W_q, D).unsqueeze(0)  # (1, N_q, D)
+        self.register_buffer("aux_token_pos", aux_pe)
+
         # ── Drive decoder (50 tokens, num_vis_levels+1 encoder levels) ────────
         self.drive_embed = nn.Embedding(50, D)
         drive_enc_levels = self.num_vis_levels + 1  # +1 for kinematic memory
@@ -144,6 +161,14 @@ class FrontCamPlanner(nn.Module):
             for _ in range(dec_layers)
         ])
         self.drive_head = nn.Linear(D, 2)
+
+        # ── Depth decoder (N_q tokens, num_vis_levels enc levels, vis-only) ───
+        self.depth_tokens = nn.Parameter(torch.randn(1, self.n_q, D) * 0.02)
+        self.depth_decoder = nn.ModuleList([
+            FlexDecoderLayer(D, num_heads, self.num_vis_levels, ffn_dim)
+            for _ in range(dec_layers)
+        ])
+        self.depth_head = TokenCNNHead(D, token_stride=self.token_stride, out_channels=1)
 
     def _get_enc_pos(self, k: int) -> Tensor:
         return getattr(self, f"enc_pos_{k}")
@@ -165,13 +190,13 @@ class FrontCamPlanner(nn.Module):
             enc_feats.append(proj(x))
         return enc_feats
 
-    def forward(self, batch: dict) -> Tensor:
+    def forward(self, batch: dict) -> dict:
         dbg = self.debug
 
         # ── Kinematic encoding ────────────────────────────────────────────────
         if dbg:
             D = self.token_dim
-            _dbg_header(f"TENSOR SHAPES  ·  FrontCamPlanner  ·  "
+            _dbg_header(f"TENSOR SHAPES  ·  FrontCamDepthPlanner  ·  "
                         f"B={batch['past_traj'].shape[0]}  D={D}")
             _dbg_sec("inputs")
             _dbg_row("past_traj",    batch["past_traj"])
@@ -229,11 +254,43 @@ class FrontCamPlanner(nn.Module):
 
         if dbg:
             _dbg_row("future_traj", future_traj, "B, future_steps, 2")
+
+        out = {"future_traj": future_traj}
+
+        # ── Depth decode (only when depth labels are in batch) ────────────────
+        if "depth" in batch:
+            enc_pos_depth = [self._get_enc_pos(k) for k in range(self.num_vis_levels)]
+            token_pos = self.aux_token_pos              # (1, N_q, D)
+
+            depth_tokens = self.depth_tokens.expand(B, -1, -1)  # (B, N_q, D)
+
+            if dbg:
+                _dbg_sec(f"depth decoder  ({len(self.depth_decoder)} × FlexDecoder  "
+                         f"vis-only cross-attn × {self.num_vis_levels} srcs)")
+                _dbg_row("depth_tokens  (init)", depth_tokens, "B, N_q, D")
+
+            for layer in self.depth_decoder:
+                depth_tokens = layer(depth_tokens, enc_feats, token_pos, enc_pos_depth)
+
+            if dbg:
+                _dbg_row("depth_tokens  (decoded)", depth_tokens)
+
+            H_q = W_q = int(math.sqrt(self.n_q))
+            # (B, N_q, D) → (B, D, H_q, W_q)
+            tokens_2d = depth_tokens.permute(0, 2, 1).reshape(B, self.token_dim, H_q, W_q)
+            depth_flat = self.depth_head(tokens_2d)     # (B, 1, 224, 224)
+            # Unsqueeze camera dim to match MultiTaskE2EModule's (B, C, 1, H, W)
+            out["depth"] = depth_flat.unsqueeze(1)      # (B, 1, 1, 224, 224)
+
+            if dbg:
+                _dbg_row("depth", out["depth"], "B, C=1, 1, H, W")
+
+        if dbg:
             print("━" * _DBG_W)
             print(f"  Parameters: {sum(p.numel() for p in self.parameters()):,}")
             print("━" * _DBG_W)
 
-        return future_traj
+        return out
 
 
 if __name__ == "__main__":
@@ -242,7 +299,7 @@ if __name__ == "__main__":
     B = 2
     token_dim = 128
 
-    model = FrontCamPlanner(
+    model = FrontCamDepthPlanner(
         token_dim=token_dim,
         num_heads=4,
         enc_layers=2,
@@ -258,9 +315,11 @@ if __name__ == "__main__":
         "acceleration": torch.zeros(B, 41, 3),
         "command":      torch.zeros(B, dtype=torch.long),
         "images":       torch.zeros(B, 1, 3, 224, 224),
+        "depth":        torch.zeros(B, 1, 1, 224, 224),
     }
 
     with torch.no_grad():
         out = model(batch)
 
-    print(f"\nOutput shape: {tuple(out.shape)}  (expected: ({B}, 50, 2))")
+    print(f"\nfuture_traj: {tuple(out['future_traj'].shape)}  (expected: ({B}, 50, 2))")
+    print(f"depth:       {tuple(out['depth'].shape)}  (expected: ({B}, 1, 1, 224, 224))")

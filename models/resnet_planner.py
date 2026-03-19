@@ -1,9 +1,9 @@
 """
-FrontCamPlanner — Single front-camera ablation planner.
+ResNetPlanner — Single front-camera planner with frozen ResNet50 backbone.
 
-Ablation model answering: "how much does a single front camera help over
-kinematics alone?"  Uses one camera instead of six, no depth/semantic
-auxiliary heads — plugs directly into E2EDrivingModule.
+Identical to FrontCamPlanner but replaces the TinyViT backbone with a
+pretrained, frozen ResNet50, whose intermediate feature maps match TinyViT's
+spatial resolutions at 224×224 input.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ARCHITECTURE  (multiscale=False default, token_dim D=128)
@@ -17,15 +17,15 @@ ARCHITECTURE  (multiscale=False default, token_dim D=128)
   command       (B,)        ─┘  (one-hot dim 4, broadcast across time)
 
   ┌──────────────────────────────┐    ┌──────────────────────────────────────┐
-  │  KinematicEncoder            │    │  TinyViT  (frozen)                   │
+  │  KinematicEncoder            │    │  ResNet50  (frozen, pretrained)      │
   │  Linear(10 → D)              │    │  in:  (B, 3, 224, 224)               │
   │  + 1D sin-cos pos enc        │    │  multiscale=True:  4 scales          │
-  │  TransformerEncoder (pre-LN) │    │    s0: (B,  96, 56, 56)  3136 tok    │
-  │  enc_layers layers           │    │    s1: (B, 192, 28, 28)   784 tok    │
-  │  ──────────────────────────  │    │    s2: (B, 384, 14, 14)   196 tok    │
-  │  kin_mem  (B, 41, D)         │    │    s3: (B, 576,  7,  7)    49 tok    │
+  │  TransformerEncoder (pre-LN) │    │    s0: (B,  256, 56, 56)  3136 tok   │
+  │  enc_layers layers           │    │    s1: (B,  512, 28, 28)   784 tok   │
+  │  ──────────────────────────  │    │    s2: (B, 1024, 14, 14)   196 tok   │
+  │  kin_mem  (B, 41, D)         │    │    s3: (B, 2048,  7,  7)    49 tok   │
   └──────────────┬───────────────┘    │  multiscale=False: bottleneck only   │
-                 │                    │    s3: (B, 576,  7,  7)    49 tok    │
+                 │                    │    s3: (B, 2048,  7,  7)    49 tok   │
                  │                    └──────────────┬───────────────────────┘
                  │                                   │  vis_projs[k]: Linear(C_k → D)
                  │                                   │  + 2D sin-cos pos enc per scale
@@ -47,19 +47,23 @@ ARCHITECTURE  (multiscale=False default, token_dim D=128)
                                                     │
                                         future_traj (B, 50, 2)
 
+  ResNet50 feature map channels (ImageNet pretrained, frozen):
+    layer1  256 ch  56×56   (after conv1 + bn1 + relu + maxpool + layer1)
+    layer2  512 ch  28×28
+    layer3 1024 ch  14×14
+    layer4 2048 ch   7×7
+
   FlexDecoder layer (pre-norm):
     tokens = tokens + SelfAttn( LN(tokens) + token_pos )
     tokens = tokens + Σ_k CrossAttn_k( LN(tokens) + token_pos,  enc_feats[k] )
     tokens = tokens + FFN( LN(tokens) )
 """
 
-import math
-
 import torch
 import torch.nn as nn
 from torch import Tensor
+import torchvision.models as tv_models
 
-from ._tinyvit import TinyViTEncoder
 from ._blocks import make_2d_sincos_pos_enc
 from .vision_transformer_planner import (
     KinematicEncoder,
@@ -72,13 +76,45 @@ from .vision_transformer_planner import (
 )
 
 
-class FrontCamPlanner(nn.Module):
+class ResNet50Encoder(nn.Module):
     """
-    Single front-camera ablation planner.
+    Frozen pretrained ResNet50 that returns intermediate feature maps.
 
-    Fuses a frozen TinyViT visual backbone (front camera only) with a
-    kinematic transformer encoder to predict future trajectories.
-    No auxiliary depth or semantic heads — use with E2EDrivingModule.
+    Returns (layer1, layer2, layer3, layer4) for a (B, 3, 224, 224) input:
+        layer1: (B,  256, 56, 56)
+        layer2: (B,  512, 28, 28)
+        layer3: (B, 1024, 14, 14)
+        layer4: (B, 2048,  7,  7)
+    """
+
+    def __init__(self):
+        super().__init__()
+        backbone = tv_models.resnet50(weights=tv_models.ResNet50_Weights.DEFAULT)
+        self.stem   = nn.Sequential(backbone.conv1, backbone.bn1,
+                                    backbone.relu, backbone.maxpool)
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+    def forward(self, x: Tensor):
+        x = self.stem(x)
+        s0 = self.layer1(x)   # (B,  256, 56, 56)
+        s1 = self.layer2(s0)  # (B,  512, 28, 28)
+        s2 = self.layer3(s1)  # (B, 1024, 14, 14)
+        s3 = self.layer4(s2)  # (B, 2048,  7,  7)
+        return s0, s1, s2, s3
+
+
+class ResNetPlanner(nn.Module):
+    """
+    Single front-camera planner with a frozen ResNet50 visual backbone.
+
+    Drop-in replacement for FrontCamPlanner — identical decoder architecture,
+    only the visual encoder differs.
 
     Args:
         token_dim:   token / model dimensionality D (default 128)
@@ -86,7 +122,7 @@ class FrontCamPlanner(nn.Module):
         enc_layers:  kinematic encoder layers (default 2)
         dec_layers:  drive decoder layers (default 3)
         ffn_dim:     FFN hidden dim (defaults to token_dim * 4)
-        multiscale:  if True, use all 4 TinyViT scales; if False, bottom-only
+        multiscale:  if True, use all 4 ResNet50 scales; if False, layer4 only
         debug:       if True, print tensor shapes during forward pass
     """
 
@@ -111,14 +147,14 @@ class FrontCamPlanner(nn.Module):
         if multiscale:
             self.num_vis_levels = 4
             self._vis_shapes = [(56, 56), (28, 28), (14, 14), (7, 7)]
-            self._vis_chans = [96, 192, 384, 576]
+            self._vis_chans = [256, 512, 1024, 2048]
         else:
             self.num_vis_levels = 1
             self._vis_shapes = [(7, 7)]
-            self._vis_chans = [576]
+            self._vis_chans = [2048]
 
-        # ── TinyViT encoder (frozen) ──────────────────────────────────────────
-        self.encoder = TinyViTEncoder(img_h=224, img_w=224)
+        # ── ResNet50 encoder (frozen) ─────────────────────────────────────────
+        self.encoder = ResNet50Encoder()
 
         # ── Visual feature projections (backbone channels → D) ────────────────
         self.vis_projs = nn.ModuleList([
@@ -150,13 +186,13 @@ class FrontCamPlanner(nn.Module):
 
     def _encode_visual(self, img: Tensor) -> list:
         """
-        Run TinyViT on (B, 3, 224, 224) front camera image and project each
-        scale to D. Returns list of (B, N_k, D) tensors, one per vis level.
+        Run ResNet50 on (B, 3, 224, 224) and project each scale to D.
+        Returns list of (B, N_k, D) tensors, one per vis level.
         """
         with torch.no_grad():
-            skip0, skip1, skip2, bot = self.encoder(img)
+            s0, s1, s2, s3 = self.encoder(img)
 
-        all_feats = [skip0, skip1, skip2, bot] if self.multiscale else [bot]
+        all_feats = [s0, s1, s2, s3] if self.multiscale else [s3]
 
         enc_feats = []
         for feat, proj in zip(all_feats, self.vis_projs):
@@ -171,7 +207,7 @@ class FrontCamPlanner(nn.Module):
         # ── Kinematic encoding ────────────────────────────────────────────────
         if dbg:
             D = self.token_dim
-            _dbg_header(f"TENSOR SHAPES  ·  FrontCamPlanner  ·  "
+            _dbg_header(f"TENSOR SHAPES  ·  ResNetPlanner  ·  "
                         f"B={batch['past_traj'].shape[0]}  D={D}")
             _dbg_sec("inputs")
             _dbg_row("past_traj",    batch["past_traj"])
@@ -191,7 +227,7 @@ class FrontCamPlanner(nn.Module):
         img = batch["images"][:, 0]         # (B, 3, 224, 224) — front cam only
 
         if dbg:
-            _dbg_sec("visual encoding  (TinyViT frozen, front cam only  →  project to D)")
+            _dbg_sec("visual encoding  (ResNet50 frozen, front cam only  →  project to D)")
             _dbg_row("img (front cam)", img, "B, 3, H, W")
 
         enc_feats = self._encode_visual(img)   # list of (B, N_k, D)
@@ -242,7 +278,7 @@ if __name__ == "__main__":
     B = 2
     token_dim = 128
 
-    model = FrontCamPlanner(
+    model = ResNetPlanner(
         token_dim=token_dim,
         num_heads=4,
         enc_layers=2,

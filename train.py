@@ -76,6 +76,26 @@ def build_model(args):
             multiscale=args.multiscale,
             debug=args.debug,
         )
+    elif args.model == "front_cam_depth":
+        from models.front_cam_depth_planner import FrontCamDepthPlanner
+        return FrontCamDepthPlanner(
+            token_dim=args.token_dim,
+            num_heads=args.nhead,
+            enc_layers=args.enc_layers,
+            dec_layers=args.dec_layers,
+            multiscale=args.multiscale,
+            debug=args.debug,
+        )
+    elif args.model == "resnet":
+        from models.resnet_planner import ResNetPlanner
+        return ResNetPlanner(
+            token_dim=args.token_dim,
+            num_heads=args.nhead,
+            enc_layers=args.enc_layers,
+            dec_layers=args.dec_layers,
+            multiscale=args.multiscale,
+            debug=args.debug,
+        )
     else:
         raise ValueError(f"Unknown model: {args.model!r}. "
                          f"Add it to the registry in train_e2e.py.")
@@ -94,7 +114,15 @@ def build_dataloaders(args):
             load_semantic=True,
             front_cam_only=args.front_cam_only,
         )
-    elif args.model == "front_cam":
+    elif args.model == "front_cam_depth":
+        ds_kwargs = dict(
+            load_images=True,
+            image_size=(224, 224),
+            load_depth=True,
+            load_semantic=False,
+            front_cam_only=True,
+        )
+    elif args.model in ("front_cam", "resnet"):
         ds_kwargs = dict(
             load_images=True,
             image_size=(224, 224),
@@ -155,7 +183,7 @@ def main():
 
     # Model
     parser.add_argument("--model",       default="mlp",
-                        choices=["mlp", "transformer", "vision_transformer", "front_cam"],
+                        choices=["mlp", "transformer", "vision_transformer", "front_cam", "front_cam_depth", "resnet"],
                         help="Model architecture to train")
     parser.add_argument("--hidden_dim",  type=int, default=256,
                         help="[mlp] hidden layer width")
@@ -223,14 +251,14 @@ def main():
 
     # ── build components ──────────────────────────────────────────────────
     model = build_model(args)
-    if args.model == "vision_transformer":
+    if args.model in ("vision_transformer", "front_cam_depth"):
         module = MultiTaskE2EModule(
             model=model,
             lr=args.lr,
             weight_decay=args.weight_decay,
             viz_samples=args.viz_samples,
             depth_weight=args.depth_weight,
-            sem_weight=args.sem_weight,
+            sem_weight=0.0 if args.model == "front_cam_depth" else args.sem_weight,
             traj_loss=args.traj_loss,
         )
     else:

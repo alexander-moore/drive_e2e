@@ -14,13 +14,13 @@ ARCHITECTURE  (multiscale=True, C=6 cameras, token_dim D=256)
   INPUTS
   images        (B, C, 3, 224, 224)    C = 6  (or 1 if front_cam_only)
   past_traj     (B, 41, 2)  ─┐
-  speed         (B, 41)     ─┤─ concat per-step → (B, 41, 7)
+  speed         (B, 41)     ─┤─ concat per-step → (B, 41, 10)
   acceleration  (B, 41, 3)  ─┤
-  command       (B,)        ─┘
+  command       (B,)        ─┘  (one-hot dim 4, broadcast across time)
 
   ┌──────────────────────────────┐    ┌──────────────────────────────────────┐
   │  KinematicEncoder            │    │  TinyViT  (frozen)                   │
-  │  Linear(7 → D)               │    │  in:  (B*C, 3, 224, 224)             │
+  │  Linear(10 → D)              │    │  in:  (B*C, 3, 224, 224)             │
   │  + 1D sin-cos pos enc        │    │  out: 4 feature pyramid scales:      │
   │  TransformerEncoder (pre-LN) │    │    s0: (B*C,  96, 56, 56)  3136 tok  │
   │  enc_layers layers           │    │    s1: (B*C, 192, 28, 28)   784 tok  │
@@ -179,8 +179,8 @@ class KinematicEncoder(nn.Module):
     """
     Encodes past kinematic history into D-dimensional tokens.
 
-    Input: [past_traj(2), speed(1), accel(3), cmd_scalar(1)] = 7 dims per step
-    → Linear(7→D) + 1D sinusoidal pos enc
+    Input: [past_traj(2), speed(1), accel(3), cmd_onehot(4)] = 10 dims per step
+    → Linear(10→D) + 1D sinusoidal pos enc
     → TransformerEncoder (pre-LN, enc_layers layers)
     → kinematic_mem: (B, 41, D)
     """
@@ -194,7 +194,7 @@ class KinematicEncoder(nn.Module):
     ):
         super().__init__()
         ffn_dim = ffn_dim or token_dim * 4
-        self.proj = nn.Linear(7, token_dim)
+        self.proj = nn.Linear(10, token_dim)
         self.register_buffer("pos_enc", _make_1d_sincos_pos_enc(41, token_dim))
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -215,10 +215,11 @@ class KinematicEncoder(nn.Module):
         past_traj = batch["past_traj"]          # (B, 41, 2)
         speed = batch["speed"].unsqueeze(-1)    # (B, 41, 1)
         accel = batch["acceleration"]           # (B, 41, 3)
-        cmd = batch["command"].float() / 3.0    # normalise to [0, 1]
-        cmd = cmd.view(B, 1, 1).expand(B, 41, 1)  # (B, 41, 1)
+        cmd_onehot = torch.zeros(B, 4, device=past_traj.device)
+        cmd_onehot.scatter_(1, batch["command"].unsqueeze(1), 1.0)  # (B, 4)
+        cmd_onehot = cmd_onehot[:, None, :].expand(B, 41, -1)       # (B, 41, 4)
 
-        x = torch.cat([past_traj, speed, accel, cmd], dim=-1)  # (B, 41, 7)
+        x = torch.cat([past_traj, speed, accel, cmd_onehot], dim=-1)  # (B, 41, 10)
         x = self.proj(x) + self.pos_enc                        # (B, 41, D)
         return self.encoder(x)                                  # (B, 41, D)
 

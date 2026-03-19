@@ -1,7 +1,7 @@
 """
 TransformerPlanner — encoder-decoder trajectory planner.
 
-Treats the 41-step kinematic history as a sequence of 7-dimensional tokens,
+Treats the 41-step kinematic history as a sequence of 10-dimensional tokens,
 encodes them with a Transformer encoder, then decodes 50 learned query tokens
 (one per future waypoint) by cross-attending to the encoded history.  Each
 output token is projected to (x, y) to produce the final trajectory.
@@ -16,7 +16,7 @@ INPUTS  (all from the batch dict)
   past_traj    (B, 41, 2)   ego (x=fwd, y=left) in ego frame
   speed        (B, 41)      scalar speed [m/s]
   acceleration (B, 41, 3)   3-D acceleration [m/s²]
-  command      (B,)         int nav command → repeated scalar feature
+  command      (B,)         int nav command → one-hot (dim 4), broadcast across time
                              0=LEFT  1=RIGHT  2=STRAIGHT  3=LANEFOLLOW
 
 OUTPUT
@@ -30,13 +30,12 @@ ARCHITECTURE
 
   past_traj  (B,41, 2) ─┐
   speed      (B,41, 1) ─┤
-  accel      (B,41, 3) ─┤─► cat ──► (B, 41, 7)
-  command    (B, 1, 1) ─┘   (broadcast command across time)
-      (normalised to [0,1])
+  accel      (B,41, 3) ─┤─► cat ──► (B, 41, 10)
+  command    (B,41, 4) ─┘   (one-hot, broadcast across time)
 
-                    (B, 41, 7)
+                    (B, 41, 10)
                          │
-              Linear(7 → d_model)
+              Linear(10 → d_model)
                          │
                   + pos encoding
                          │
@@ -84,8 +83,8 @@ class TransformerPlanner(nn.Module):
         self.num_commands = num_commands
 
         # ── input projection ──────────────────────────────────────────────
-        # 7 features per timestep: 2 (xy) + 1 (speed) + 3 (accel) + 1 (cmd)
-        self.input_proj = nn.Linear(7, d_model)
+        # 10 features per timestep: 2 (xy) + 1 (speed) + 3 (accel) + 4 (cmd one-hot)
+        self.input_proj = nn.Linear(10, d_model)
 
         # ── positional encoding (fixed sinusoidal) ────────────────────────
         self.register_buffer("pos_enc", self._build_pos_enc(max(past_steps, future_steps), d_model))
@@ -144,17 +143,18 @@ class TransformerPlanner(nn.Module):
 
         B, T, _ = past_traj.shape
 
-        # Normalise command to [0, 1] and broadcast across time
-        cmd = (command.float() / (self.num_commands - 1))   # (B,)
-        cmd = cmd[:, None, None].expand(B, T, 1)            # (B, 41, 1)
+        # One-hot encode command and broadcast across time
+        cmd_onehot = torch.zeros(B, self.num_commands, device=past_traj.device)
+        cmd_onehot.scatter_(1, command.unsqueeze(1), 1.0)   # (B, 4)
+        cmd_onehot = cmd_onehot[:, None, :].expand(B, T, -1)  # (B, 41, 4)
 
-        # Build (B, 41, 7) input sequence
+        # Build (B, 41, 10) input sequence
         tokens = torch.cat([
             past_traj,                          # (B, 41, 2)
             speed.unsqueeze(-1),                # (B, 41, 1)
             acceleration,                       # (B, 41, 3)
-            cmd,                                # (B, 41, 1)
-        ], dim=-1)                              # (B, 41, 7)
+            cmd_onehot,                         # (B, 41, 4)
+        ], dim=-1)                              # (B, 41, 10)
 
         # Project to d_model and add positional encoding
         x = self.input_proj(tokens)             # (B, 41, d_model)

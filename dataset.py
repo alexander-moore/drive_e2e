@@ -131,15 +131,25 @@ class Bench2DriveDataset(Dataset):
             return json.load(fp)
 
     def _load_depth_label(self, scenario_path: Path, cam_suffix: str, frame_idx: int) -> torch.Tensor:
-        """Load depth label as float32 tensor (1, H, W)."""
+        """Load depth label as float32 tensor (1, H, W).
+
+        Returns an all-zero tensor (treated as invalid by SILogLoss) if the
+        file is missing or corrupt.
+        """
         img_path = scenario_path / "camera" / f"depth_{cam_suffix}" / f"{frame_idx:05d}.png"
-        img = Image.open(img_path)
-        if self.image_size is not None:
-            img = img.resize((self.image_size[1], self.image_size[0]), Image.BILINEAR)
-        arr = np.array(img, dtype=np.float32)
-        if arr.ndim == 3:
-            arr = arr[..., 0]
-        return torch.from_numpy(arr).unsqueeze(0)  # (1, H, W) float32
+        H, W = self.image_size if self.image_size is not None else (None, None)
+        try:
+            img = Image.open(img_path)
+            if self.image_size is not None:
+                img = img.resize((self.image_size[1], self.image_size[0]), Image.BILINEAR)
+            arr = np.array(img, dtype=np.float32)
+            if arr.ndim == 3:
+                arr = arr[..., 0]
+            return torch.from_numpy(arr).unsqueeze(0)  # (1, H, W) float32
+        except Exception:
+            out_h = self.image_size[0] if self.image_size is not None else 1
+            out_w = self.image_size[1] if self.image_size is not None else 1
+            return torch.zeros(1, out_h, out_w, dtype=torch.float32)
 
     def _load_semantic_label(self, scenario_path: Path, cam_suffix: str, frame_idx: int) -> torch.Tensor:
         """Load semantic label from instance PNG R-channel as int64 tensor (H, W)."""
