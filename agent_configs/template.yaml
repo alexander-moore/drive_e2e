@@ -1,0 +1,60 @@
+# E2EBench2DriveAgent configuration template
+#
+# Set TEAM_AGENT to bench2drive_agent.py and TEAM_CONFIG to this file.
+#
+# ─────────────────────────────────────────────────
+# MODEL — pick one block below and fill ckpt_path
+# ─────────────────────────────────────────────────
+
+# ── MLP (trajectory-only, no images) ──
+# model:
+#   type: mlp
+#   hidden_dim: 256
+#   num_layers: 4
+
+# ── Transformer (trajectory-only, no images) ──
+# model:
+#   type: transformer
+#   d_model: 128
+#   nhead: 4
+#   enc_layers: 3
+#   dec_layers: 3
+#   dim_feedforward: 512
+
+# ── ResNet front-camera planner ──
+model:
+  type: resnet
+  token_dim: 128
+  nhead: 4
+  enc_layers: 2
+  dec_layers: 3
+  multiscale: false          # true = use all 4 ResNet feature scales
+  backbone: resnet50         # resnet18 | resnet34 | resnet50 | resnet101 | resnet152
+  frozen_backbone: true      # keep backbone weights fixed during training; matches ckpt
+
+# ── Front-camera TinyViT planner ──
+# model:
+#   type: front_cam
+#   token_dim: 256
+#   nhead: 4
+#   enc_layers: 2
+#   dec_layers: 3
+#   multiscale: false
+
+# Path to the Lightning checkpoint (.ckpt) saved by ModelCheckpoint.
+ckpt_path: /workspace/e2e/checkpoints/last.ckpt
+
+# ─────────────────────────────────────────────────
+# DEVICE
+# ─────────────────────────────────────────────────
+device: cuda    # cuda | cpu
+
+# ─────────────────────────────────────────────────
+# CONTROL PARAMETERS
+# ─────────────────────────────────────────────────
+max_speed:       8.0     # m/s — absolute speed cap sent to controller
+steer_lookahead: 1.0     # seconds ahead for steering target (0-indexed: index 9)
+speed_lookahead: 2.0     # seconds ahead for desired-speed estimation
+k_steer:         1.0     # gain: angle_rad → normalised steer [-1, 1]
+k_throttle:      0.5     # gain: speed_error_m/s → throttle [0, max_throttle]
+k_brake:         1.5     # gain: overspeed_m/s  → brake    [0, 1]

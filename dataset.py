@@ -59,8 +59,10 @@ def world_to_ego(points_world: np.ndarray, x0: float, y0: float, theta: float) -
     dx = points_world[:, 0] - x0
     dy = points_world[:, 1] - y0
     cos_t, sin_t = np.cos(theta), np.sin(theta)
-    x_ego = dx * cos_t + dy * sin_t
-    y_ego = -dx * sin_t + dy * cos_t
+    # CARLA theta=0 means the vehicle faces world -Y (not +X), so the forward
+    # unit vector is (sin θ, -cos θ) and the left unit vector is (cos θ, sin θ).
+    x_ego =  dx * sin_t - dy * cos_t   # forward
+    y_ego =  dx * cos_t + dy * sin_t   # left
     return np.stack([x_ego, y_ego], axis=1)
 
 
@@ -124,6 +126,19 @@ class Bench2DriveDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    _VIZ_CHUNKS = 4  # number of temporal chunks per scenario for visualization
+
+    def _viz_scenario_key(self, scenario_path: Path, anchor_idx: int) -> str:
+        """Return a viz key that encodes which temporal chunk of a scenario this
+        sample belongs to (e.g. 'ScenarioName_part2'). Used by the viz buffer
+        to collect samples spread across the full timeline, not just the start."""
+        n = len(self.anno_cache[scenario_path])
+        valid_start = PAST_STEPS
+        valid_end   = n - FUTURE_STEPS  # exclusive
+        chunk = (anchor_idx - valid_start) * self._VIZ_CHUNKS // (valid_end - valid_start)
+        chunk = min(chunk, self._VIZ_CHUNKS - 1)
+        return f"{scenario_path.name}_part{chunk}"
 
     def _load_anno(self, scenario_path: Path, frame_idx: int) -> dict:
         f = self.anno_cache[scenario_path][frame_idx]
@@ -227,7 +242,10 @@ class Bench2DriveDataset(Dataset):
             # Command
             "command": torch.tensor(command, dtype=torch.long),
             # Metadata (not used for training, helpful for debugging)
+            # scenario_viz subdivides each scenario's timeline into 4 equal chunks
+            # so the viz buffer collects samples from different parts of each video.
             "scenario": str(scenario_path.name),
+            "scenario_viz": self._viz_scenario_key(scenario_path, anchor_idx),
             "anchor_idx": anchor_idx,
         }
 

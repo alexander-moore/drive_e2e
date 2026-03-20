@@ -1,12 +1,13 @@
 """
-ResNetPlanner — Single front-camera planner with frozen ResNet50 backbone.
+ResNetPlanner — Single front-camera planner with a configurable ResNet backbone.
 
 Identical to FrontCamPlanner but replaces the TinyViT backbone with a
-pretrained, frozen ResNet50, whose intermediate feature maps match TinyViT's
-spatial resolutions at 224×224 input.
+pretrained ResNet, whose intermediate feature maps match TinyViT's spatial
+resolutions at 224×224 input.  The backbone variant and whether it is frozen
+are both configurable.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ARCHITECTURE  (multiscale=False default, token_dim D=128)
+ARCHITECTURE  (multiscale=False default, token_dim D=128, backbone=resnet50)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   INPUTS
@@ -17,15 +18,15 @@ ARCHITECTURE  (multiscale=False default, token_dim D=128)
   command       (B,)        ─┘  (one-hot dim 4, broadcast across time)
 
   ┌──────────────────────────────┐    ┌──────────────────────────────────────┐
-  │  KinematicEncoder            │    │  ResNet50  (frozen, pretrained)      │
+  │  KinematicEncoder            │    │  ResNet  (pretrained, frozen or not) │
   │  Linear(10 → D)              │    │  in:  (B, 3, 224, 224)               │
   │  + 1D sin-cos pos enc        │    │  multiscale=True:  4 scales          │
-  │  TransformerEncoder (pre-LN) │    │    s0: (B,  256, 56, 56)  3136 tok   │
-  │  enc_layers layers           │    │    s1: (B,  512, 28, 28)   784 tok   │
-  │  ──────────────────────────  │    │    s2: (B, 1024, 14, 14)   196 tok   │
-  │  kin_mem  (B, 41, D)         │    │    s3: (B, 2048,  7,  7)    49 tok   │
+  │  TransformerEncoder (pre-LN) │    │    s0: (B,  C1, 56, 56)  3136 tok    │
+  │  enc_layers layers           │    │    s1: (B,  C2, 28, 28)   784 tok    │
+  │  ──────────────────────────  │    │    s2: (B,  C3, 14, 14)   196 tok    │
+  │  kin_mem  (B, 41, D)         │    │    s3: (B,  C4,  7,  7)    49 tok    │
   └──────────────┬───────────────┘    │  multiscale=False: bottleneck only   │
-                 │                    │    s3: (B, 2048,  7,  7)    49 tok   │
+                 │                    │    s3: (B,  C4,  7,  7)    49 tok    │
                  │                    └──────────────┬───────────────────────┘
                  │                                   │  vis_projs[k]: Linear(C_k → D)
                  │                                   │  + 2D sin-cos pos enc per scale
@@ -47,11 +48,9 @@ ARCHITECTURE  (multiscale=False default, token_dim D=128)
                                                     │
                                         future_traj (B, 50, 2)
 
-  ResNet50 feature map channels (ImageNet pretrained, frozen):
-    layer1  256 ch  56×56   (after conv1 + bn1 + relu + maxpool + layer1)
-    layer2  512 ch  28×28
-    layer3 1024 ch  14×14
-    layer4 2048 ch   7×7
+  Backbone channel sizes at 224×224 input:
+    resnet18 / resnet34  (basic block):      C1=64   C2=128  C3=256  C4=512
+    resnet50 / resnet101 / resnet152  (bottleneck): C1=256 C2=512 C3=1024 C4=2048
 
   FlexDecoder layer (pre-norm):
     tokens = tokens + SelfAttn( LN(tokens) + token_pos )
@@ -76,42 +75,62 @@ from .vision_transformer_planner import (
 )
 
 
-class ResNet50Encoder(nn.Module):
-    """
-    Frozen pretrained ResNet50 that returns intermediate feature maps.
+# ---------------------------------------------------------------------------
+# Backbone registry
+# ---------------------------------------------------------------------------
 
-    Returns (layer1, layer2, layer3, layer4) for a (B, 3, 224, 224) input:
-        layer1: (B,  256, 56, 56)
-        layer2: (B,  512, 28, 28)
-        layer3: (B, 1024, 14, 14)
-        layer4: (B, 2048,  7,  7)
+# (constructor, weights, [layer1_ch, layer2_ch, layer3_ch, layer4_ch])
+_BACKBONES = {
+    "resnet18":  (tv_models.resnet18,  tv_models.ResNet18_Weights.DEFAULT,  [64,  128,  256,  512]),
+    "resnet34":  (tv_models.resnet34,  tv_models.ResNet34_Weights.DEFAULT,  [64,  128,  256,  512]),
+    "resnet50":  (tv_models.resnet50,  tv_models.ResNet50_Weights.DEFAULT,  [256, 512, 1024, 2048]),
+    "resnet101": (tv_models.resnet101, tv_models.ResNet101_Weights.DEFAULT, [256, 512, 1024, 2048]),
+    "resnet152": (tv_models.resnet152, tv_models.ResNet152_Weights.DEFAULT, [256, 512, 1024, 2048]),
+}
+
+
+class ResNetEncoder(nn.Module):
+    """
+    Pretrained ResNet backbone that returns four intermediate feature maps.
+
+    Args:
+        variant: one of resnet18 / resnet34 / resnet50 / resnet101 / resnet152
+        frozen:  if True, all backbone parameters are frozen (no gradients)
+
+    Returns (layer1, layer2, layer3, layer4) for a (B, 3, 224, 224) input.
+    Channel sizes depend on variant — see _BACKBONES table above.
     """
 
-    def __init__(self):
+    def __init__(self, variant: str = "resnet50", frozen: bool = True):
         super().__init__()
-        backbone = tv_models.resnet50(weights=tv_models.ResNet50_Weights.DEFAULT)
+        if variant not in _BACKBONES:
+            raise ValueError(f"Unknown ResNet variant {variant!r}. "
+                             f"Choose from: {list(_BACKBONES)}")
+        constructor, weights, self.out_channels = _BACKBONES[variant]
+        backbone = constructor(weights=weights)
         self.stem   = nn.Sequential(backbone.conv1, backbone.bn1,
                                     backbone.relu, backbone.maxpool)
         self.layer1 = backbone.layer1
         self.layer2 = backbone.layer2
         self.layer3 = backbone.layer3
         self.layer4 = backbone.layer4
-
-        for p in self.parameters():
-            p.requires_grad_(False)
+        self.frozen = frozen
+        if frozen:
+            for p in self.parameters():
+                p.requires_grad_(False)
 
     def forward(self, x: Tensor):
-        x = self.stem(x)
-        s0 = self.layer1(x)   # (B,  256, 56, 56)
-        s1 = self.layer2(s0)  # (B,  512, 28, 28)
-        s2 = self.layer3(s1)  # (B, 1024, 14, 14)
-        s3 = self.layer4(s2)  # (B, 2048,  7,  7)
+        x  = self.stem(x)
+        s0 = self.layer1(x)
+        s1 = self.layer2(s0)
+        s2 = self.layer3(s1)
+        s3 = self.layer4(s2)
         return s0, s1, s2, s3
 
 
 class ResNetPlanner(nn.Module):
     """
-    Single front-camera planner with a frozen ResNet50 visual backbone.
+    Single front-camera planner with a configurable ResNet visual backbone.
 
     Drop-in replacement for FrontCamPlanner — identical decoder architecture,
     only the visual encoder differs.
@@ -122,7 +141,9 @@ class ResNetPlanner(nn.Module):
         enc_layers:  kinematic encoder layers (default 2)
         dec_layers:  drive decoder layers (default 3)
         ffn_dim:     FFN hidden dim (defaults to token_dim * 4)
-        multiscale:  if True, use all 4 ResNet50 scales; if False, layer4 only
+        multiscale:  if True, use all 4 ResNet scales; if False, layer4 only
+        backbone:    ResNet variant — resnet18/34/50/101/152 (default resnet50)
+        frozen:      if True, backbone weights are frozen (default True)
         debug:       if True, print tensor shapes during forward pass
     """
 
@@ -134,27 +155,31 @@ class ResNetPlanner(nn.Module):
         dec_layers: int = 3,
         ffn_dim: int = None,
         multiscale: bool = False,
+        backbone: str = "resnet50",
+        frozen: bool = True,
         debug: bool = False,
     ):
         super().__init__()
         D = token_dim
         self.token_dim = D
         self.multiscale = multiscale
+        self.frozen = frozen
         self.debug = debug
         ffn_dim = ffn_dim or D * 4
+
+        # ── ResNet backbone ───────────────────────────────────────────────────
+        self.encoder = ResNetEncoder(variant=backbone, frozen=frozen)
+        all_chans = self.encoder.out_channels   # [C1, C2, C3, C4]
 
         # ── Visual scale configuration ────────────────────────────────────────
         if multiscale:
             self.num_vis_levels = 4
             self._vis_shapes = [(56, 56), (28, 28), (14, 14), (7, 7)]
-            self._vis_chans = [256, 512, 1024, 2048]
+            self._vis_chans = all_chans
         else:
             self.num_vis_levels = 1
             self._vis_shapes = [(7, 7)]
-            self._vis_chans = [2048]
-
-        # ── ResNet50 encoder (frozen) ─────────────────────────────────────────
-        self.encoder = ResNet50Encoder()
+            self._vis_chans = [all_chans[-1]]
 
         # ── Visual feature projections (backbone channels → D) ────────────────
         self.vis_projs = nn.ModuleList([
@@ -186,10 +211,11 @@ class ResNetPlanner(nn.Module):
 
     def _encode_visual(self, img: Tensor) -> list:
         """
-        Run ResNet50 on (B, 3, 224, 224) and project each scale to D.
+        Run the ResNet backbone on (B, 3, 224, 224) and project each scale to D.
         Returns list of (B, N_k, D) tensors, one per vis level.
         """
-        with torch.no_grad():
+        ctx = torch.no_grad() if self.frozen else torch.enable_grad()
+        with ctx:
             s0, s1, s2, s3 = self.encoder(img)
 
         all_feats = [s0, s1, s2, s3] if self.multiscale else [s3]
@@ -204,7 +230,6 @@ class ResNetPlanner(nn.Module):
     def forward(self, batch: dict) -> Tensor:
         dbg = self.debug
 
-        # ── Kinematic encoding ────────────────────────────────────────────────
         if dbg:
             D = self.token_dim
             _dbg_header(f"TENSOR SHAPES  ·  ResNetPlanner  ·  "
@@ -223,11 +248,11 @@ class ResNetPlanner(nn.Module):
             _dbg_sec("kinematic encoding")
             _dbg_row("kin_mem", kin_mem, "B, past_steps, D")
 
-        # ── Visual encoding ───────────────────────────────────────────────────
         img = batch["images"][:, 0]         # (B, 3, 224, 224) — front cam only
 
         if dbg:
-            _dbg_sec("visual encoding  (ResNet50 frozen, front cam only  →  project to D)")
+            frozen_str = "frozen" if self.frozen else "trainable"
+            _dbg_sec(f"visual encoding  (ResNet {frozen_str}, front cam only  →  project to D)")
             _dbg_row("img (front cam)", img, "B, 3, H, W")
 
         enc_feats = self._encode_visual(img)   # list of (B, N_k, D)
@@ -238,17 +263,14 @@ class ResNetPlanner(nn.Module):
                 _dbg_row(f"enc_feats[{k}]  ({H}×{W} → {H*W} tok)", feat,
                          f"scale {k}  (B, N_k, D)")
 
-        # Encoder sources for drive decoder: vis scales + kinematic memory
         enc_feats_drive = list(enc_feats) + [kin_mem]
-
         enc_pos_drive = [
             self._get_enc_pos(k) for k in range(self.num_vis_levels)
         ]
-        enc_pos_drive.append(self.kin_pos)  # (1, 41, D)
+        enc_pos_drive.append(self.kin_pos)
 
-        # ── Drive decode ──────────────────────────────────────────────────────
         drive_tokens = self.drive_embed.weight.unsqueeze(0).expand(B, -1, -1)
-        drive_pos = self.drive_pos          # (1, 50, D)
+        drive_pos = self.drive_pos
 
         if dbg:
             _dbg_sec(f"drive decoder  ({len(self.drive_decoder)} × FlexDecoder  "
@@ -273,30 +295,22 @@ class ResNetPlanner(nn.Module):
 
 
 if __name__ == "__main__":
-    print(__doc__)
+    import torch
 
-    B = 2
-    token_dim = 128
-
-    model = ResNetPlanner(
-        token_dim=token_dim,
-        num_heads=4,
-        enc_layers=2,
-        dec_layers=3,
-        multiscale=False,
-        debug=True,
-    )
-    model.eval()
-
-    batch = {
-        "past_traj":    torch.zeros(B, 41, 2),
-        "speed":        torch.zeros(B, 41),
-        "acceleration": torch.zeros(B, 41, 3),
-        "command":      torch.zeros(B, dtype=torch.long),
-        "images":       torch.zeros(B, 1, 3, 224, 224),
-    }
-
-    with torch.no_grad():
-        out = model(batch)
-
-    print(f"\nOutput shape: {tuple(out.shape)}  (expected: ({B}, 50, 2))")
+    for variant in ["resnet18", "resnet50"]:
+        for frozen in [True, False]:
+            print(f"\n--- {variant}  frozen={frozen} ---")
+            model = ResNetPlanner(backbone=variant, frozen=frozen, debug=False)
+            model.eval()
+            batch = {
+                "past_traj":    torch.zeros(2, 41, 2),
+                "speed":        torch.zeros(2, 41),
+                "acceleration": torch.zeros(2, 41, 3),
+                "command":      torch.zeros(2, dtype=torch.long),
+                "images":       torch.zeros(2, 1, 3, 224, 224),
+            }
+            with torch.no_grad():
+                out = model(batch)
+            n = sum(p.numel() for p in model.parameters())
+            n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"  output: {tuple(out.shape)}  total={n:,}  trainable={n_trainable:,}")

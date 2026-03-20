@@ -94,6 +94,8 @@ def build_model(args):
             enc_layers=args.enc_layers,
             dec_layers=args.dec_layers,
             multiscale=args.multiscale,
+            backbone=args.resnet_variant,
+            frozen=not args.trainable_backbone,
             debug=args.debug,
         )
     else:
@@ -214,8 +216,15 @@ def main():
                         help="[vision_transformer] use only TinyViT bottom level")
     parser.add_argument("--front_cam_only", action="store_true", default=False,
                         help="[vision_transformer] use only front camera")
+    parser.add_argument("--resnet_variant", default="resnet50",
+                        choices=["resnet18", "resnet34", "resnet50", "resnet101", "resnet152"],
+                        help="[resnet] which ResNet variant to use as backbone")
+    parser.add_argument("--trainable_backbone", action="store_true", default=False,
+                        help="[resnet] unfreeze backbone weights during training")
 
     # Debug
+    parser.add_argument("--name", default=None,
+                        help="Experiment name shown in TensorBoard (default: model name)")
     parser.add_argument("--debug", action="store_true", default=False,
                         help="Debug mode: print tensor shapes at vital stages and run only a few steps")
 
@@ -242,11 +251,12 @@ def main():
                         help="Checkpoint output directory")
     parser.add_argument("--ckpt_path",   default=None,
                         help="Resume training from this checkpoint")
-    parser.add_argument("--viz_samples", type=int, default=4,
+    parser.add_argument("--viz_samples", type=int, default=5,
                         help="Number of trajectories to visualise per val epoch")
 
     args = parser.parse_args()
 
+    torch.set_float32_matmul_precision("high")
     pl.seed_everything(42, workers=True)
 
     # ── build components ──────────────────────────────────────────────────
@@ -272,12 +282,13 @@ def main():
     train_dl, val_dl = build_dataloaders(args)
 
     # ── callbacks & logger ────────────────────────────────────────────────
-    logger = TensorBoardLogger(save_dir=args.log_dir, name=args.model)
+    exp_name = args.name or args.model
+    logger = TensorBoardLogger(save_dir=args.log_dir, name=exp_name)
 
     callbacks = [
         ModelCheckpoint(
             dirpath=args.ckpt_dir,
-            filename=f"{args.model}-{{epoch:03d}}-{{val/avg_l2:.4f}}",
+            filename=f"{exp_name}-{{epoch:03d}}-{{val/avg_l2:.4f}}",
             monitor="val/avg_l2",   # primary SOTA metric: mean L2 @ 1s/2s/3s
             mode="min",
             save_top_k=3,
@@ -302,7 +313,7 @@ def main():
     )
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"\nModel : {args.model}  ({n_params:,} params)")
+    print(f"\nModel : {args.model}  ({n_params:,} params)  [{exp_name}]")
     print(f"Train : {len(train_dl.dataset)} samples  ({args.data_root})")
     print(f"Val   : {len(val_dl.dataset)} samples  ({args.val_data_root or args.data_root})")
     print(f"Logs  : {logger.log_dir}")

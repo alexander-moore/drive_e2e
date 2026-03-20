@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchmetrics.classification import MulticlassJaccardIndex, MulticlassAccuracy
 
-from visualization import plot_trajectory, plot_trajectory_batch
+from visualization import plot_trajectory, plot_trajectory_batch, plot_trajectory_on_image
 try:
     from losses import SILogLoss, DiceLoss, abs_rel, imitation_l1        # when run from e2e/ dir
 except ImportError:
@@ -199,17 +199,27 @@ class E2EDrivingModule(pl.LightningModule):
     def validation_step(self, batch: dict, batch_idx: int):
         loss, pred = self._step(batch, "val")
 
-        # Buffer a few samples for potential visualization
-        if len(self._viz_buffer) < self.viz_samples:
-            n = min(self.viz_samples - len(self._viz_buffer), pred.shape[0])
-            for i in range(n):
-                self._viz_buffer.append({
-                    "past_traj":   batch["past_traj"][i].cpu(),
-                    "future_traj": batch["future_traj"][i].cpu(),
-                    "pred_traj":   pred[i].detach().cpu(),
-                    "scenario":    batch["scenario"][i] if "scenario" in batch else "",
-                    "anchor_idx":  int(batch["anchor_idx"][i]) if "anchor_idx" in batch else -1,
-                })
+        # Buffer one sample per unique scenario for visualization
+        buffered_scenes = {s["scenario"] for s in self._viz_buffer}
+        for i in range(pred.shape[0]):
+            if len(self._viz_buffer) >= self.viz_samples:
+                break
+            scenario = batch.get("scenario_viz", batch.get("scenario", [f"frame{int(batch['anchor_idx'][i])}"]))[i]
+            if scenario in buffered_scenes:
+                continue
+            buffered_scenes.add(scenario)
+            entry = {
+                "past_traj":   batch["past_traj"][i].cpu(),
+                "future_traj": batch["future_traj"][i].cpu(),
+                "pred_traj":   pred[i].detach().cpu(),
+                "scenario":    scenario,
+                "anchor_idx":  int(batch["anchor_idx"][i]) if "anchor_idx" in batch else -1,
+            }
+            if "images" in batch:
+                img = batch["images"][i, 0].cpu()           # (3, H, W) float
+                img = (img * 255).clamp(0, 255).byte()
+                entry["image"] = img.permute(1, 2, 0).numpy()  # (H, W, 3)
+            self._viz_buffer.append(entry)
         return loss
 
     def on_validation_epoch_end(self):
@@ -237,7 +247,7 @@ class E2EDrivingModule(pl.LightningModule):
 
         for s in self._viz_buffer:
             scene = s["scenario"] or f"frame{s['anchor_idx']}"
-            title = f"best  epoch {self.current_epoch}  {scene}  frame {s['anchor_idx']}"
+            title = f"epoch {self.current_epoch}  {scene}  frame {s['anchor_idx']}"
             plot_trajectory(
                 past_traj=s["past_traj"].numpy(),
                 future_traj_gt=s["future_traj"].numpy(),
@@ -245,6 +255,14 @@ class E2EDrivingModule(pl.LightningModule):
                 title=title,
                 save_path=str(viz_dir / f"{scene}.png"),
             )
+            if "image" in s:
+                plot_trajectory_on_image(
+                    image=s["image"],
+                    future_traj_gt=s["future_traj"].numpy(),
+                    future_traj_pred=s["pred_traj"].numpy(),
+                    title=title,
+                    save_path=str(viz_dir / f"{scene}_cam.png"),
+                )
 
         # Also save a batch grid
         scene_titles = [s["scenario"] or f"frame{s['anchor_idx']}" for s in self._viz_buffer]
@@ -384,17 +402,27 @@ class MultiTaskE2EModule(E2EDrivingModule):
         loss, output = self._step(batch, "val")
         pred_traj = output["future_traj"]
 
-        # Buffer samples for trajectory visualization
-        if len(self._viz_buffer) < self.viz_samples:
-            n = min(self.viz_samples - len(self._viz_buffer), pred_traj.shape[0])
-            for i in range(n):
-                self._viz_buffer.append({
-                    "past_traj":   batch["past_traj"][i].cpu(),
-                    "future_traj": batch["future_traj"][i].cpu(),
-                    "pred_traj":   pred_traj[i].detach().cpu(),
-                    "scenario":    batch["scenario"][i] if "scenario" in batch else "",
-                    "anchor_idx":  int(batch["anchor_idx"][i]) if "anchor_idx" in batch else -1,
-                })
+        # Buffer one sample per unique scenario for visualization
+        buffered_scenes = {s["scenario"] for s in self._viz_buffer}
+        for i in range(pred_traj.shape[0]):
+            if len(self._viz_buffer) >= self.viz_samples:
+                break
+            scenario = batch.get("scenario_viz", batch.get("scenario", [f"frame{int(batch['anchor_idx'][i])}"]))[i]
+            if scenario in buffered_scenes:
+                continue
+            buffered_scenes.add(scenario)
+            entry = {
+                "past_traj":   batch["past_traj"][i].cpu(),
+                "future_traj": batch["future_traj"][i].cpu(),
+                "pred_traj":   pred_traj[i].detach().cpu(),
+                "scenario":    scenario,
+                "anchor_idx":  int(batch["anchor_idx"][i]) if "anchor_idx" in batch else -1,
+            }
+            if "images" in batch:
+                img = batch["images"][i, 0].cpu()           # (3, H, W) float
+                img = (img * 255).clamp(0, 255).byte()
+                entry["image"] = img.permute(1, 2, 0).numpy()  # (H, W, 3)
+            self._viz_buffer.append(entry)
 
         # Depth quality metrics
         if "depth" in batch and "depth" in output:

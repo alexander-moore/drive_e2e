@@ -1,0 +1,23 @@
+# MLP planner — trajectory-only baseline (no camera images required)
+#
+# Best checkpoint: mlp-epoch=008-val/avg_l2=2.6390.ckpt  (val/avg_l2 = 2.639 m)
+# Architecture must match the hyperparameters used at training time.
+
+model:
+  type:        mlp
+  hidden_dim:  256
+  num_layers:  4
+  dropout:     0.0     # disable at inference
+
+ckpt_path: /workspace/e2e/checkpoints/mlp-epoch=008-val/avg_l2=2.6390.ckpt
+
+device: cuda   # set to "cpu" if no GPU available
+
+# Trajectory controller gains
+# These are starting values; tune on a 1-route debug run before the full eval.
+max_speed:        6.0    # m/s — MLP tends to predict conservative speeds
+steer_lookahead:  1.0    # seconds ahead for steering target (waypoint index 9)
+speed_lookahead:  2.0    # seconds ahead for desired-speed estimation
+k_steer:          1.0
+k_throttle:       0.5
+k_brake:          1.5
