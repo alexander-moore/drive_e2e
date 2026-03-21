@@ -261,6 +261,7 @@ class Bench2DriveDataset(Dataset):
             # so the viz buffer collects samples from different parts of each video.
             "scenario": str(scenario_path.name),
             "scenario_viz": self._viz_scenario_key(scenario_path, anchor_idx),
+            "scenario_path": str(scenario_path),
             "anchor_idx": anchor_idx,
         }
 

@@ -30,6 +30,7 @@ world_to_ego applies the same rotation used at training time (from dataset.py):
 
 from __future__ import annotations
 
+import glob
 import math
 import os
 import sys
@@ -305,6 +306,96 @@ def preprocess_image(rgba: np.ndarray, device: torch.device) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Frame-saving helper (for MP4 recording)
+# ---------------------------------------------------------------------------
+
+def _save_frame(
+    rgba: "np.ndarray",
+    traj: "np.ndarray",
+    speed: float,
+    throttle: float,
+    steer: float,
+    brake: float,
+    step: int,
+    frame_dir: str,
+) -> None:
+    """
+    Save a single annotated camera frame as PNG.
+
+    Draws the predicted trajectory as a bird's-eye inset (bottom-right corner)
+    and overlays a HUD with speed / control values in the top-left.
+
+    Args:
+        rgba:       (H, W, 4) uint8 CARLA front-camera image.
+        traj:       (50, 2) ego-frame waypoints (x=fwd, y=left), metres.
+        speed:      current ego speed in m/s.
+        throttle/steer/brake: controller outputs [0, 1].
+        step:       frame index (used for filename ordering).
+        frame_dir:  directory to write PNG files into.
+    """
+    import cv2  # available in b2d conda env
+
+    # Convert RGBA → BGR for OpenCV
+    bgr = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+    H, W = bgr.shape[:2]
+
+    # ── HUD overlay (top-left) ────────────────────────────────────────────
+    hud_lines = [
+        f"Step   : {step:04d}",
+        f"Speed  : {speed:.1f} m/s",
+        f"Throttle: {throttle:.2f}",
+        f"Steer  : {steer:.2f}",
+        f"Brake  : {brake:.2f}",
+    ]
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45
+    thickness  = 1
+    line_h     = 18
+    pad        = 6
+    for i, line in enumerate(hud_lines):
+        y = pad + (i + 1) * line_h
+        cv2.putText(bgr, line, (pad, y), font, font_scale,
+                    (0, 0, 0),   thickness + 1, cv2.LINE_AA)  # shadow
+        cv2.putText(bgr, line, (pad, y), font, font_scale,
+                    (255, 255, 255), thickness, cv2.LINE_AA)
+
+    # ── Bird's-eye trajectory inset (bottom-right) ────────────────────────
+    bev_size  = min(H, W) // 3   # ~75 px for 224×224
+    bev_range = 20.0             # metres shown ahead/side
+
+    bev = np.zeros((bev_size, bev_size, 3), dtype=np.uint8)
+    bev[:] = (30, 30, 30)        # dark background
+
+    def world_to_bev(x_fwd, y_left):
+        """Ego-frame metres → pixel coords inside bev canvas."""
+        px = int(bev_size // 2 - y_left / bev_range * bev_size // 2)
+        py = int(bev_size - 2   - x_fwd  / bev_range * (bev_size - 4))
+        return np.clip(px, 0, bev_size - 1), np.clip(py, 0, bev_size - 1)
+
+    # Draw ego vehicle marker
+    cx, cy = world_to_bev(0, 0)
+    cv2.circle(bev, (cx, cy), 4, (0, 200, 255), -1)
+
+    # Draw trajectory dots (green → yellow gradient)
+    n = len(traj)
+    for idx, (x_fwd, y_left) in enumerate(traj):
+        px, py = world_to_bev(x_fwd, y_left)
+        t      = idx / max(n - 1, 1)
+        color  = (0, int(255 * (1 - t)), int(255 * t))  # green→red
+        cv2.circle(bev, (px, py), 1, color, -1)
+
+    # Paste inset into bottom-right of frame
+    bev_border = 4
+    y1 = H - bev_size - bev_border
+    x1 = W - bev_size - bev_border
+    bgr[y1:y1 + bev_size, x1:x1 + bev_size] = bev
+
+    # ── Write PNG ─────────────────────────────────────────────────────────
+    out_path = os.path.join(frame_dir, f"{step:06d}.png")
+    cv2.imwrite(out_path, bgr)
+
+
 # The Agent
 # ---------------------------------------------------------------------------
 
@@ -393,12 +484,22 @@ class E2EBench2DriveAgent(_AGENT_BASE):
         self.metric_info: Dict = {}
         self._step = 0
 
+        # ── Video recording ───────────────────────────────────────────────
+        # Frames are saved to <save_path>/frames/ and stitched to MP4 in destroy().
+        save_path = os.environ.get("SAVE_PATH", "")
+        if save_path:
+            self._frame_dir = os.path.join(save_path, "frames")
+            os.makedirs(self._frame_dir, exist_ok=True)
+        else:
+            self._frame_dir = None
+
         # ── Hero vehicle reference (set by leaderboard framework) ─────────
         # self._hero is injected by the base class after setup() completes.
 
         print(f"[E2EBench2DriveAgent] model={model_type}  "
               f"ckpt={cfg['ckpt_path']}  device={device_str}  "
-              f"vision={self._needs_images}")
+              f"vision={self._needs_images}  "
+              f"frame_dir={self._frame_dir}")
 
     # ── Sensor list ───────────────────────────────────────────────────────
 
@@ -554,6 +655,7 @@ class E2EBench2DriveAgent(_AGENT_BASE):
         batch = self._build_batch(wx, wy, theta)
 
         # Attach image for vision models
+        rgba = None
         if self._needs_images:
             rgba = input_data[CAM_FRONT_ID][1]   # (H, W, 4) uint8
             batch["images"] = preprocess_image(rgba, self._device)
@@ -577,6 +679,11 @@ class E2EBench2DriveAgent(_AGENT_BASE):
         control.throttle = float(throttle)
         control.steer    = float(steer)
         control.brake    = float(brake)
+
+        # ── Save annotated frame for MP4 ──────────────────────────────────
+        if self._frame_dir is not None and rgba is not None:
+            _save_frame(rgba, traj, speed, throttle, steer, brake,
+                        self._step, self._frame_dir)
 
         # ── Record metric_info (needed by Bench2Drive for smoothness/efficiency) ──
         self.metric_info[self._step] = self._get_metric_info()
@@ -615,5 +722,24 @@ class E2EBench2DriveAgent(_AGENT_BASE):
     # ── Cleanup ───────────────────────────────────────────────────────────
 
     def destroy(self) -> None:
-        """Called after the route finishes; release resources if needed."""
-        pass
+        """Called after the route finishes; stitch saved frames to MP4."""
+        if self._frame_dir and os.path.isdir(self._frame_dir):
+            frames = sorted(glob.glob(os.path.join(self._frame_dir, "*.png")))
+            if frames:
+                # Allow the wrapper script to name the MP4 after the scene.
+                # E2E_VIDEO_NAME=HardBreakRoute_1  →  HardBreakRoute_1.mp4
+                video_name = os.environ.get("E2E_VIDEO_NAME", "agent_video")
+                out_dir    = os.environ.get("E2E_VIDEO_DIR",
+                                            os.path.dirname(self._frame_dir))
+                os.makedirs(out_dir, exist_ok=True)
+                mp4_path = os.path.join(out_dir, f"{video_name}.mp4")
+                cmd = (
+                    f"ffmpeg -y -framerate 10 -pattern_type glob "
+                    f"-i '{self._frame_dir}/*.png' "
+                    f"-c:v libx264 -pix_fmt yuv420p '{mp4_path}'"
+                )
+                ret = os.system(cmd)
+                if ret == 0:
+                    print(f"[E2EBench2DriveAgent] MP4 saved → {mp4_path}")
+                else:
+                    print(f"[E2EBench2DriveAgent] ffmpeg failed (exit {ret}), frames kept in {self._frame_dir}")

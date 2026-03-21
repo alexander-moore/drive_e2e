@@ -20,7 +20,8 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchmetrics.classification import MulticlassJaccardIndex, MulticlassAccuracy
 
-from visualization import plot_trajectory, plot_trajectory_batch, plot_trajectory_on_image
+from visualization import (plot_trajectory, plot_trajectory_batch,
+                           plot_trajectory_on_image, save_trajectory_video)
 try:
     from losses import SILogLoss, DiceLoss, abs_rel, imitation_l1        # when run from e2e/ dir
 except ImportError:
@@ -199,30 +200,64 @@ class E2EDrivingModule(pl.LightningModule):
     def validation_step(self, batch: dict, batch_idx: int):
         loss, pred = self._step(batch, "val")
 
-        # Buffer one sample per unique scenario for visualization
+        # Buffer samples for visualization, preferring frames with lateral curvature
+        # (max absolute y-displacement in future_traj) so we show turns, not just
+        # straight segments. Half the budget is reserved for curved frames; the rest
+        # are filled with whatever is available.
+        n_curved  = max(1, self.viz_samples // 2)
+        n_any     = self.viz_samples
+
+        curved  = [s for s in self._viz_buffer if s.get("curved")]
+        straight = [s for s in self._viz_buffer if not s.get("curved")]
         buffered_scenes = {s["scenario"] for s in self._viz_buffer}
+
         for i in range(pred.shape[0]):
-            if len(self._viz_buffer) >= self.viz_samples:
+            if len(self._viz_buffer) >= n_any:
                 break
             scenario = batch.get("scenario_viz", batch.get("scenario", [f"frame{int(batch['anchor_idx'][i])}"]))[i]
             if scenario in buffered_scenes:
                 continue
+
+            ft = batch["future_traj"][i]                     # (50, 2)
+            max_lateral = ft[:, 1].abs().max().item()        # max |y| = lateral swing
+            is_curved = max_lateral > 1.0                    # >1 m lateral = meaningful turn
+
+            # Skip straight frames once curved quota is met but straight slots remain
+            if is_curved and len(curved) >= n_curved:
+                continue
+            if not is_curved and len(straight) >= (n_any - n_curved):
+                continue
+
             buffered_scenes.add(scenario)
             entry = {
-                "past_traj":   batch["past_traj"][i].cpu(),
-                "future_traj": batch["future_traj"][i].cpu(),
-                "pred_traj":   pred[i].detach().cpu(),
-                "scenario":    scenario,
-                "anchor_idx":  int(batch["anchor_idx"][i]) if "anchor_idx" in batch else -1,
+                "past_traj":     batch["past_traj"][i].cpu(),
+                "future_traj":   ft.cpu(),
+                "pred_traj":     pred[i].detach().cpu(),
+                "scenario":      scenario,
+                "scenario_path": batch.get("scenario_path", [None] * pred.shape[0])[i],
+                "anchor_idx":    int(batch["anchor_idx"][i]) if "anchor_idx" in batch else -1,
+                "curved":        is_curved,
             }
             if "images" in batch:
                 img = batch["images"][i, 0].cpu()           # (3, H, W) float
+                # Undo ImageNet normalisation if applied (values outside [0,1] indicate it was)
+                if img.min() < 0 or img.max() > 1:
+                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                    std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                    img  = img * std + mean
                 img = (img * 255).clamp(0, 255).byte()
                 entry["image"] = img.permute(1, 2, 0).numpy()  # (H, W, 3)
             self._viz_buffer.append(entry)
+            if is_curved:
+                curved.append(entry)
+            else:
+                straight.append(entry)
         return loss
 
     def on_validation_epoch_end(self):
+        if self.trainer.sanity_checking:
+            self._viz_buffer.clear()
+            return
         # Read the metric that was just logged (gathered across all devices)
         current = self.trainer.callback_metrics.get("val/avg_l2")
         if current is None:
@@ -262,6 +297,16 @@ class E2EDrivingModule(pl.LightningModule):
                     future_traj_pred=s["pred_traj"].float().numpy(),
                     title=title,
                     save_path=str(viz_dir / f"{scene}_cam.png"),
+                )
+
+            if s.get("curved") and s.get("scenario_path") and s["anchor_idx"] >= 0:
+                save_trajectory_video(
+                    scenario_path=s["scenario_path"],
+                    anchor_idx=s["anchor_idx"],
+                    past_traj=s["past_traj"].float().numpy(),
+                    future_traj_gt=s["future_traj"].float().numpy(),
+                    future_traj_pred=s["pred_traj"].float().numpy(),
+                    save_path=str(viz_dir / f"{scene}_video.mp4"),
                 )
 
         # Also save a batch grid
@@ -402,27 +447,54 @@ class MultiTaskE2EModule(E2EDrivingModule):
         loss, output = self._step(batch, "val")
         pred_traj = output["future_traj"]
 
-        # Buffer one sample per unique scenario for visualization
+        # Buffer samples for visualization, preferring frames with lateral curvature
+        n_curved  = max(1, self.viz_samples // 2)
+        n_any     = self.viz_samples
+
+        curved   = [s for s in self._viz_buffer if s.get("curved")]
+        straight = [s for s in self._viz_buffer if not s.get("curved")]
         buffered_scenes = {s["scenario"] for s in self._viz_buffer}
+
         for i in range(pred_traj.shape[0]):
-            if len(self._viz_buffer) >= self.viz_samples:
+            if len(self._viz_buffer) >= n_any:
                 break
             scenario = batch.get("scenario_viz", batch.get("scenario", [f"frame{int(batch['anchor_idx'][i])}"]))[i]
             if scenario in buffered_scenes:
                 continue
+
+            ft = batch["future_traj"][i]
+            max_lateral = ft[:, 1].abs().max().item()
+            is_curved = max_lateral > 1.0
+
+            if is_curved and len(curved) >= n_curved:
+                continue
+            if not is_curved and len(straight) >= (n_any - n_curved):
+                continue
+
             buffered_scenes.add(scenario)
             entry = {
-                "past_traj":   batch["past_traj"][i].cpu(),
-                "future_traj": batch["future_traj"][i].cpu(),
-                "pred_traj":   pred_traj[i].detach().cpu(),
-                "scenario":    scenario,
-                "anchor_idx":  int(batch["anchor_idx"][i]) if "anchor_idx" in batch else -1,
+                "past_traj":     batch["past_traj"][i].cpu(),
+                "future_traj":   ft.cpu(),
+                "pred_traj":     pred_traj[i].detach().cpu(),
+                "scenario":      scenario,
+                "scenario_path": batch.get("scenario_path", [None] * pred_traj.shape[0])[i],
+                "anchor_idx":    int(batch["anchor_idx"][i]) if "anchor_idx" in batch else -1,
+                "curved":        is_curved,
             }
             if "images" in batch:
                 img = batch["images"][i, 0].cpu()           # (3, H, W) float
+                # Undo ImageNet normalisation if applied (values outside [0,1] indicate it was)
+                if img.min() < 0 or img.max() > 1:
+                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                    std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                    img  = img * std + mean
                 img = (img * 255).clamp(0, 255).byte()
                 entry["image"] = img.permute(1, 2, 0).numpy()  # (H, W, 3)
             self._viz_buffer.append(entry)
+            if is_curved:
+                curved.append(entry)
+            else:
+                straight.append(entry)
 
         # Depth quality metrics
         if "depth" in batch and "depth" in output:
@@ -445,6 +517,9 @@ class MultiTaskE2EModule(E2EDrivingModule):
         return loss
 
     def on_validation_epoch_end(self):
+        if self.trainer.sanity_checking:
+            self._viz_buffer.clear()
+            return
         # Trajectory visualization (same logic as parent)
         current = self.trainer.callback_metrics.get("val/avg_l2")
         if current is not None:

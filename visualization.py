@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
 import torch
+import cv2
 
 
 # ---------------------------------------------------------------------------
@@ -428,3 +429,164 @@ def plot_video_prediction(
         plt.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Trajectory video — animated camera + BEV overlay
+# ---------------------------------------------------------------------------
+
+def save_trajectory_video(
+    scenario_path: str,
+    anchor_idx: int,
+    past_traj: np.ndarray,          # (T_past, 2)  ego frame at anchor
+    future_traj_gt: np.ndarray,     # (T_future, 2)
+    future_traj_pred: np.ndarray,   # (T_future, 2)
+    save_path: str,
+    fps: int = 10,
+    cam_w: int = 640,
+    cam_h: int = 360,
+    past_context: int = 20,         # frames of past video to show before anchor
+) -> None:
+    """
+    Generate an MP4 with two panels per frame:
+      Left : front camera video with GT (green) and predicted (red) waypoints
+             projected onto the image.
+      Right: bird's-eye-view trajectory plot with an animated dot showing
+             the current position along each trajectory.
+
+    All trajectories are in the anchor frame's ego coordinate system
+    (x=forward, y=left), so the BEV remains static while the dot animates.
+
+    Args:
+        scenario_path   : path to the scenario folder (contains camera/rgb_front/)
+        anchor_idx      : frame index of the anchor (current) timestep
+        past_traj       : (T_past, 2) past positions in ego frame
+        future_traj_gt  : (T_future, 2) ground-truth future waypoints
+        future_traj_pred: (T_future, 2) predicted future waypoints
+        save_path       : output .mp4 file path
+        fps             : video frame rate (10 Hz matches data collection)
+        cam_w / cam_h   : camera panel dimensions in pixels
+        past_context    : past video frames to include before the anchor
+    """
+    scenario_path = Path(scenario_path)
+    T_past   = len(past_traj)
+    T_future = len(future_traj_gt)
+    frame_indices = list(range(anchor_idx - past_context, anchor_idx + T_future + 1))
+
+    # BEV axis limits with padding
+    all_pts = np.vstack([past_traj, future_traj_gt, future_traj_pred])
+    x_min, x_max = all_pts[:, 0].min() - 3, all_pts[:, 0].max() + 3
+    y_min, y_max = all_pts[:, 1].min() - 3, all_pts[:, 1].max() + 3
+
+    bev_px  = cam_h   # BEV panel is square, same height as camera panel
+    video_w = cam_w + bev_px
+    video_h = cam_h
+
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(save_path, fourcc, fps, (video_w, video_h))
+
+    for frame_idx in frame_indices:
+        t = frame_idx - anchor_idx   # negative=past, 0=anchor, positive=future
+
+        # ── Camera panel ──────────────────────────────────────────────────
+        img_path = scenario_path / "camera" / "rgb_front" / f"{frame_idx:05d}.jpg"
+        if img_path.exists():
+            cam_bgr = cv2.imread(str(img_path))
+            cam_bgr = cv2.resize(cam_bgr, (cam_w, cam_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            cam_bgr = np.zeros((cam_h, cam_w, 3), dtype=np.uint8)
+
+        # Project full GT + pred trajectories onto camera image
+        for traj, bgr_color in [
+            (future_traj_gt,    (50, 205,  50)),   # limegreen BGR
+            (future_traj_pred,  (60,  80, 220)),   # tomato BGR
+        ]:
+            px = _project_ego_traj_to_pixels(traj, cam_h, cam_w)
+            valid_pts = px[~np.isnan(px[:, 0])].astype(np.int32)
+            if len(valid_pts) > 1:
+                cv2.polylines(cam_bgr, [valid_pts.reshape(-1, 1, 2)],
+                              False, bgr_color, 1, cv2.LINE_AA)
+            for u, v in valid_pts:
+                cv2.circle(cam_bgr, (int(u), int(v)), 3, bgr_color, -1)
+
+        # Highlight the current waypoint when in the future window
+        if 0 <= t < T_future:
+            for traj, bgr_color in [
+                (future_traj_gt,   (50, 205,  50)),
+                (future_traj_pred, (60,  80, 220)),
+            ]:
+                px = _project_ego_traj_to_pixels(traj[t:t+1], cam_h, cam_w)
+                if not np.isnan(px[0, 0]):
+                    u, v = int(px[0, 0]), int(px[0, 1])
+                    cv2.circle(cam_bgr, (u, v), 7, bgr_color,      -1)
+                    cv2.circle(cam_bgr, (u, v), 7, (255, 255, 255),  1)
+
+        # Timestamp label
+        label = f"t={t/10:+.1f}s"
+        cv2.putText(cam_bgr, label, (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(cam_bgr, label, (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,   0,   0),   1, cv2.LINE_AA)
+
+        # ── BEV panel via matplotlib ───────────────────────────────────────
+        dpi = 100
+        fig, ax = plt.subplots(figsize=(bev_px / dpi, bev_px / dpi), dpi=dpi)
+        ax.set_facecolor("#1a1a2e")
+        fig.patch.set_facecolor("#1a1a2e")
+
+        ax.plot(past_traj[:, 1],        past_traj[:, 0],
+                color="royalblue", lw=1.5, alpha=0.6)
+        ax.plot(future_traj_gt[:, 1],   future_traj_gt[:, 0],
+                color="limegreen", lw=1.5, alpha=0.7)
+        ax.plot(future_traj_pred[:, 1], future_traj_pred[:, 0],
+                color="tomato",    lw=1.5, alpha=0.7)
+        ax.scatter(0, 0, color="white", s=60, marker="*", zorder=5)
+
+        # Animated position dot
+        if t < 0:
+            past_offset = t + past_context
+            idx = max(0, min(T_past - 1, T_past - past_context - 1 + past_offset))
+            pt = past_traj[idx]
+            ax.scatter(pt[1], pt[0], s=90, color="royalblue",
+                       edgecolors="white", linewidths=1.2, zorder=6)
+        elif t < T_future:
+            ax.scatter(future_traj_gt[t][1],   future_traj_gt[t][0],   s=90,
+                       color="limegreen", edgecolors="white", linewidths=1.2, zorder=6)
+            ax.scatter(future_traj_pred[t][1], future_traj_pred[t][0], s=90,
+                       color="tomato",    edgecolors="white", linewidths=1.2, zorder=6)
+
+        ax.set_xlim(y_min, y_max)
+        ax.set_ylim(x_min, x_max)
+        ax.set_aspect("equal")
+        ax.tick_params(colors="gray", labelsize=5)
+        ax.set_xlabel("lateral (m)", color="gray", fontsize=5)
+        ax.set_ylabel("forward (m)", color="gray", fontsize=5)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#444")
+        ax.legend(
+            handles=[
+                Line2D([0], [0], color="limegreen", lw=2, label="GT"),
+                Line2D([0], [0], color="tomato",    lw=2, label="pred"),
+                Line2D([0], [0], color="royalblue", lw=2, label="past"),
+            ],
+            loc="upper right", fontsize=5,
+            facecolor="#333", labelcolor="white", framealpha=0.7,
+        )
+
+        plt.tight_layout(pad=0.2)
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        canvas = FigureCanvasAgg(fig)
+        canvas.draw()
+        w, h    = canvas.get_width_height()
+        bev_rgb = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
+        plt.close(fig)
+
+        bev_bgr = cv2.cvtColor(
+            cv2.resize(bev_rgb, (bev_px, cam_h), interpolation=cv2.INTER_LINEAR),
+            cv2.COLOR_RGB2BGR,
+        )
+
+        writer.write(np.hstack([cam_bgr, bev_bgr]))
+
+    writer.release()
