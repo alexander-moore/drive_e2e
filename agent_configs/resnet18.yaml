@@ -1,0 +1,26 @@
+# ResNet-18 front-camera planner (trainable backbone)
+#
+# Best checkpoint: resnet18_trainable_frontcam-epoch=002-val/avg_l2=1.8575.ckpt
+# Trained with: python train.py --model resnet --backbone resnet18 --frozen_backbone false
+
+model:
+  type: resnet
+  token_dim: 256
+  nhead: 4
+  enc_layers: 3
+  dec_layers: 3
+  multiscale: true
+  backbone: resnet18
+  frozen_backbone: false
+
+ckpt_path: /home/farm/Documents/Projects/drive_e2e/checkpoints/resnet18_trainable_frontcam-epoch=002-val/avg_l2=1.8575.ckpt
+
+device: cuda
+
+# Trajectory controller gains
+max_speed:        6.0
+steer_lookahead:  1.0
+speed_lookahead:  2.0
+k_steer:          1.0
+k_throttle:       0.5
+k_brake:          1.5

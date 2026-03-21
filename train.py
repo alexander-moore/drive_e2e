@@ -112,6 +112,7 @@ def build_dataloaders(args):
         ds_kwargs = dict(
             load_images=True,
             image_size=(224, 224),
+            normalize=True,
             load_depth=True,
             load_semantic=True,
             front_cam_only=args.front_cam_only,
@@ -120,6 +121,7 @@ def build_dataloaders(args):
         ds_kwargs = dict(
             load_images=True,
             image_size=(224, 224),
+            normalize=True,
             load_depth=True,
             load_semantic=False,
             front_cam_only=True,
@@ -128,6 +130,7 @@ def build_dataloaders(args):
         ds_kwargs = dict(
             load_images=True,
             image_size=(224, 224),
+            normalize=True,
             load_depth=False,
             load_semantic=False,
             front_cam_only=True,

@@ -31,9 +31,16 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 
+# ImageNet normalisation constants (used by all pretrained torchvision backbones)
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+_IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
-# CARLA RoadOption enum values present in bench2drive
-COMMAND_MAP = {2: 0, 3: 1, 4: 2, 5: 3}  # LEFT, RIGHT, STRAIGHT, LANEFOLLOW -> 0,1,2,3
+
+# CARLA 0.9.15 RoadOption enum → our 0-indexed command
+#   CARLA: LEFT=1, RIGHT=2, STRAIGHT=3, LANEFOLLOW=4, CHANGELANELEFT=5, CHANGELANERIGHT=6
+#   Ours:  LEFT=0, RIGHT=1, STRAIGHT=2, LANEFOLLOW=3
+#   Lane-change commands (5,6) are treated as LANEFOLLOW (same lane-following behaviour).
+COMMAND_MAP = {1: 0, 2: 1, 3: 2, 4: 3, 5: 3, 6: 3}
 CAMERAS = [
     "rgb_front", "rgb_front_left", "rgb_front_right",
     "rgb_back", "rgb_back_left", "rgb_back_right",
@@ -92,6 +99,7 @@ class Bench2DriveDataset(Dataset):
         image_size: Optional[Tuple[int, int]] = (224, 400),
         load_images: bool = True,
         transform=None,
+        normalize: bool = False,
         load_depth: bool = False,
         load_semantic: bool = False,
         front_cam_only: bool = False,
@@ -100,6 +108,7 @@ class Bench2DriveDataset(Dataset):
         self.image_size = image_size
         self.load_images = load_images
         self.transform = transform
+        self.normalize = normalize
         self.load_depth = load_depth
         self.load_semantic = load_semantic
         self.front_cam_only = front_cam_only
@@ -122,7 +131,13 @@ class Bench2DriveDataset(Dataset):
             # Need PAST_STEPS frames before anchor + FUTURE_STEPS frames after
             for anchor_idx in range(PAST_STEPS, n - FUTURE_STEPS):
                 self.samples.append((scenario_path, anchor_idx))
-            self.anno_cache[scenario_path] = anno_files
+            # Pre-load all anno dicts into memory to avoid repeated gzip+JSON I/O
+            # in __getitem__ (92 file opens per sample otherwise)
+            parsed = []
+            for f in anno_files:
+                with gzip.open(f, "rt") as fp:
+                    parsed.append(json.load(fp))
+            self.anno_cache[scenario_path] = parsed
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -141,9 +156,7 @@ class Bench2DriveDataset(Dataset):
         return f"{scenario_path.name}_part{chunk}"
 
     def _load_anno(self, scenario_path: Path, frame_idx: int) -> dict:
-        f = self.anno_cache[scenario_path][frame_idx]
-        with gzip.open(f, "rt") as fp:
-            return json.load(fp)
+        return self.anno_cache[scenario_path][frame_idx]
 
     def _load_depth_label(self, scenario_path: Path, cam_suffix: str, frame_idx: int) -> torch.Tensor:
         """Load depth label as float32 tensor (1, H, W).
@@ -181,6 +194,8 @@ class Bench2DriveDataset(Dataset):
         if self.image_size is not None:
             img = img.resize((self.image_size[1], self.image_size[0]), Image.BILINEAR)
         tensor = TF.to_tensor(img)  # (3, H, W), float32 in [0, 1]
+        if self.normalize:
+            tensor = (tensor - _IMAGENET_MEAN) / _IMAGENET_STD
         if self.transform is not None:
             tensor = self.transform(tensor)
         return tensor
@@ -278,18 +293,37 @@ class Bench2DriveDataset(Dataset):
 
 # ── Convenience factory functions ─────────────────────────────────────────────
 
+# Bench2Drive-mini scenarios (from tools/download_mini.sh) used as the
+# canonical validation split. Excluded from training regardless of whether
+# they appear in the full dataset.
+BENCH2DRIVE_MINI_SCENARIOS = [
+    "HardBreakRoute_Town01_Route30_Weather3",
+    "DynamicObjectCrossing_Town02_Route13_Weather6",
+    "Accident_Town03_Route156_Weather0",
+    "YieldToEmergencyVehicle_Town04_Route165_Weather7",
+    "ConstructionObstacle_Town05_Route68_Weather8",
+    "ParkedObstacle_Town10HD_Route371_Weather7",
+    "ControlLoss_Town11_Route401_Weather11",
+    "AccidentTwoWays_Town12_Route1444_Weather0",
+    "OppositeVehicleTakingPriority_Town13_Route600_Weather2",
+    "VehicleTurningRoute_Town15_Route443_Weather1",
+]
+
+
 def make_datasets(root: str, val_scenarios: Optional[List[str]] = None, **kwargs):
     """
-    Split bench2drive_mini into train/val datasets.
+    Split bench2drive into train/val datasets.
 
-    By default uses the last 2 scenarios (alphabetically) as validation.
+    By default uses the Bench2Drive-mini scenarios as validation. Any mini
+    scenario present in the dataset root is used for val and excluded from
+    training; mini scenarios not present are simply skipped.
     """
     all_scenarios = sorted(
         d.name for d in Path(root).iterdir()
         if d.is_dir() and (d / "anno").exists()
     )
     if val_scenarios is None:
-        val_scenarios = all_scenarios[-2:]
+        val_scenarios = [s for s in BENCH2DRIVE_MINI_SCENARIOS if s in all_scenarios]
     train_scenarios = [s for s in all_scenarios if s not in val_scenarios]
 
     train_ds = Bench2DriveDataset(root, scenarios=train_scenarios, **kwargs)

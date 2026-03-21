@@ -45,6 +45,20 @@ import torch.nn as nn
 # We import it lazily inside methods that need it so the file can be imported
 # and tested outside of CARLA without error.
 
+# AutonomousAgent is only available when the leaderboard is on PYTHONPATH.
+# Fall back to plain object so dry_run.py can import this file without CARLA.
+try:
+    from leaderboard.autoagents.autonomous_agent import AutonomousAgent, Track
+    _AGENT_BASE = AutonomousAgent
+except ImportError:
+    _AGENT_BASE = object
+    Track = None
+
+
+def get_entry_point():
+    """Required by the Bench2Drive leaderboard evaluator."""
+    return "E2EBench2DriveAgent"
+
 # ---------------------------------------------------------------------------
 # Constants — must match dataset.py
 # ---------------------------------------------------------------------------
@@ -53,8 +67,10 @@ PAST_STEPS_TOTAL = 41    # 40 history frames + 1 anchor frame (current)
 FUTURE_STEPS     = 50    # 5 s @ 10 Hz
 IMAGE_H, IMAGE_W = 224, 224
 
-# CARLA RoadOption → our 0-indexed command (same mapping as dataset.py)
-COMMAND_MAP = {2: 0, 3: 1, 4: 2, 5: 3}   # LEFT, RIGHT, STRAIGHT, LANEFOLLOW
+# CARLA 0.9.15 RoadOption → our 0-indexed command (must match dataset.py)
+#   CARLA: LEFT=1, RIGHT=2, STRAIGHT=3, LANEFOLLOW=4, CHANGELANELEFT=5, CHANGELANERIGHT=6
+#   Ours:  LEFT=0, RIGHT=1, STRAIGHT=2, LANEFOLLOW=3
+COMMAND_MAP = {1: 0, 2: 1, 3: 2, 4: 3, 5: 3, 6: 3}
 
 # Sensor IDs (must match sensors() list below)
 CAM_FRONT_ID = "CAM_FRONT"
@@ -292,16 +308,13 @@ def preprocess_image(rgba: np.ndarray, device: torch.device) -> torch.Tensor:
 # The Agent
 # ---------------------------------------------------------------------------
 
-class E2EBench2DriveAgent:
+class E2EBench2DriveAgent(_AGENT_BASE):
     """
     Bench2Drive / CARLA leaderboard agent wrapping our trajectory-prediction
     models.
 
-    This class is intentionally not a subclass of AutonomousAgent at the
-    module level so that the file can be imported without CARLA being present.
-    Inside the CARLA environment the leaderboard injects the correct base
-    class at import time.  If you need to subclass explicitly (e.g. for
-    offline testing), see the end of this file.
+    Inherits from AutonomousAgent when the leaderboard is available on
+    PYTHONPATH; falls back to plain object for offline testing (dry_run.py).
 
     Config keys (YAML):
         model.type          : mlp | transformer | front_cam | resnet | ...
@@ -319,11 +332,24 @@ class E2EBench2DriveAgent:
     # Set to True for models that take images (front_cam, resnet, vision_transformer)
     _VISION_MODELS = {"front_cam", "front_cam_depth", "resnet", "vision_transformer"}
 
+    def __init__(self, carla_host="localhost", carla_port=2000, debug=False):
+        if _AGENT_BASE is not object:
+            super().__init__(carla_host, carla_port, debug)
+            # hero_actor is set by AutonomousAgent.__init__ → get_hero()
+            self._hero = self.hero_actor
+
     def setup(self, path_to_conf_file: str) -> None:
         """Called once before evaluation starts."""
         import yaml
 
-        with open(path_to_conf_file) as f:
+        # Required by the leaderboard to determine the sensor track.
+        if Track is not None:
+            self.track = Track.SENSORS
+
+        # The leaderboard appends '+<save_name>' to the config path for logging;
+        # strip it to get the actual YAML file path.
+        yaml_path = path_to_conf_file.split('+')[0]
+        with open(yaml_path) as f:
             cfg = yaml.safe_load(f)
 
         # ── Device ────────────────────────────────────────────────────────
@@ -413,24 +439,31 @@ class E2EBench2DriveAgent:
 
     def _update_command(self, ego_x: float, ego_y: float) -> int:
         """
-        Walk the global plan to find the closest future waypoint and return
-        its RoadOption mapped to our 0-indexed command.
+        Return the RoadOption command for the next waypoint AHEAD of the
+        vehicle, mapped to our 0-indexed command encoding.
+
+        Strategy: find the closest waypoint, then advance a few steps further
+        along the plan so the command reflects an upcoming manoeuvre rather
+        than the segment the vehicle is already on.
         """
         if not self._global_plan_world:
             return 3   # LANEFOLLOW
 
-        # Find the closest plan waypoint ahead of the current position
+        # Find index of the closest plan waypoint
+        best_idx  = 0
         best_dist = float("inf")
-        best_cmd  = 5   # LANEFOLLOW
-        for transform, road_option in self._global_plan_world:
+        for i, (transform, _) in enumerate(self._global_plan_world):
             wx = transform.location.x
             wy = transform.location.y
             dist = math.sqrt((wx - ego_x) ** 2 + (wy - ego_y) ** 2)
             if dist < best_dist:
                 best_dist = dist
-                best_cmd  = int(road_option)   # RoadOption enum value
+                best_idx  = i
 
-        return COMMAND_MAP.get(best_cmd, 3)
+        # Advance 3 waypoints ahead to get the upcoming manoeuvre command
+        lookahead_idx = min(best_idx + 3, len(self._global_plan_world) - 1)
+        _, road_option = self._global_plan_world[lookahead_idx]
+        return COMMAND_MAP.get(int(road_option), 3)
 
     # ── Per-step helpers ──────────────────────────────────────────────────
 

@@ -9,7 +9,7 @@ model:
   num_layers:  4
   dropout:     0.0     # disable at inference
 
-ckpt_path: /workspace/e2e/checkpoints/mlp-epoch=008-val/avg_l2=2.6390.ckpt
+ckpt_path: /home/farm/Documents/Projects/drive_e2e/checkpoints/mlp-random-weights.ckpt  # replace with real trained checkpoint
 
 device: cuda   # set to "cpu" if no GPU available
 

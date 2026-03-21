@@ -249,17 +249,17 @@ class E2EDrivingModule(pl.LightningModule):
             scene = s["scenario"] or f"frame{s['anchor_idx']}"
             title = f"epoch {self.current_epoch}  {scene}  frame {s['anchor_idx']}"
             plot_trajectory(
-                past_traj=s["past_traj"].numpy(),
-                future_traj_gt=s["future_traj"].numpy(),
-                future_traj_pred=s["pred_traj"].numpy(),
+                past_traj=s["past_traj"].float().numpy(),
+                future_traj_gt=s["future_traj"].float().numpy(),
+                future_traj_pred=s["pred_traj"].float().numpy(),
                 title=title,
                 save_path=str(viz_dir / f"{scene}.png"),
             )
             if "image" in s:
                 plot_trajectory_on_image(
                     image=s["image"],
-                    future_traj_gt=s["future_traj"].numpy(),
-                    future_traj_pred=s["pred_traj"].numpy(),
+                    future_traj_gt=s["future_traj"].float().numpy(),
+                    future_traj_pred=s["pred_traj"].float().numpy(),
                     title=title,
                     save_path=str(viz_dir / f"{scene}_cam.png"),
                 )
@@ -267,9 +267,9 @@ class E2EDrivingModule(pl.LightningModule):
         # Also save a batch grid
         scene_titles = [s["scenario"] or f"frame{s['anchor_idx']}" for s in self._viz_buffer]
         plot_trajectory_batch(
-            past_trajs=torch.stack([s["past_traj"]   for s in self._viz_buffer]).numpy(),
-            future_trajs_gt=torch.stack([s["future_traj"] for s in self._viz_buffer]).numpy(),
-            future_trajs_pred=torch.stack([s["pred_traj"]  for s in self._viz_buffer]).numpy(),
+            past_trajs=torch.stack([s["past_traj"]   for s in self._viz_buffer]).float().numpy(),
+            future_trajs_gt=torch.stack([s["future_traj"] for s in self._viz_buffer]).float().numpy(),
+            future_trajs_pred=torch.stack([s["pred_traj"]  for s in self._viz_buffer]).float().numpy(),
             titles=scene_titles,
             save_path=str(viz_dir / "grid.png"),
         )
