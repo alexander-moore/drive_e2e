@@ -239,7 +239,8 @@ class E2EDrivingModule(pl.LightningModule):
                 "curved":        is_curved,
             }
             if "images" in batch:
-                img = batch["images"][i, 0].cpu()           # (3, H, W) float
+                raw = batch["images"][i]
+                img = (raw[-1, 0] if raw.dim() == 5 else raw[0]).cpu()   # (3, H, W)
                 # Undo ImageNet normalisation if applied (values outside [0,1] indicate it was)
                 if img.min() < 0 or img.max() > 1:
                     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -482,7 +483,8 @@ class MultiTaskE2EModule(E2EDrivingModule):
                 "curved":        is_curved,
             }
             if "images" in batch:
-                img = batch["images"][i, 0].cpu()           # (3, H, W) float
+                raw = batch["images"][i]
+                img = (raw[-1, 0] if raw.dim() == 5 else raw[0]).cpu()   # (3, H, W)
                 # Undo ImageNet normalisation if applied (values outside [0,1] indicate it was)
                 if img.min() < 0 or img.max() > 1:
                     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)

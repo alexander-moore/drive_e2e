@@ -18,6 +18,7 @@ Coordinate convention (ego frame):
     Matches Waymo challenge convention.
 """
 
+import functools
 import gzip
 import json
 import math
@@ -72,6 +73,16 @@ def world_to_ego(points_world: np.ndarray, x0: float, y0: float, theta: float) -
     x_ego =  dx * sin_t - dy * cos_t   # forward
     y_ego =  dx * cos_t + dy * sin_t   # left
     return np.stack([x_ego, y_ego], axis=1)
+
+
+@functools.lru_cache(maxsize=None)
+def _load_anno_cached(filepath: str):
+    """Load and cache a single gzip-JSON annotation file (per worker process)."""
+    try:
+        with gzip.open(filepath, "rt") as fp:
+            return json.load(fp)
+    except (json.JSONDecodeError, EOFError, OSError):
+        return None
 
 
 class Bench2DriveDataset(Dataset):
@@ -131,22 +142,19 @@ class Bench2DriveDataset(Dataset):
 
         # Build index: list of (scenario_path, anchor_frame_idx)
         self.samples: List[Tuple[Path, int]] = []
-        self.anno_cache: dict = {}  # scenario_path -> sorted list of anno file paths
+        # Maps scenario_path -> sorted list of anno file paths (no data loaded)
+        self.anno_files: dict = {}
+        # Maps scenario_path -> frame count (for viz key computation)
+        self.scenario_n_frames: dict = {}
 
         for scenario_name in scenarios:
             scenario_path = self.root / scenario_name
             anno_files = sorted((scenario_path / "anno").glob("*.json.gz"))
             n = len(anno_files)
-            # Need PAST_STEPS frames before anchor + FUTURE_STEPS frames after
+            self.anno_files[scenario_path] = anno_files
+            self.scenario_n_frames[scenario_path] = n
             for anchor_idx in range(PAST_STEPS, n - FUTURE_STEPS):
                 self.samples.append((scenario_path, anchor_idx))
-            # Pre-load all anno dicts into memory to avoid repeated gzip+JSON I/O
-            # in __getitem__ (92 file opens per sample otherwise)
-            parsed = []
-            for f in anno_files:
-                with gzip.open(f, "rt") as fp:
-                    parsed.append(json.load(fp))
-            self.anno_cache[scenario_path] = parsed
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -157,7 +165,7 @@ class Bench2DriveDataset(Dataset):
         """Return a viz key that encodes which temporal chunk of a scenario this
         sample belongs to (e.g. 'ScenarioName_part2'). Used by the viz buffer
         to collect samples spread across the full timeline, not just the start."""
-        n = len(self.anno_cache[scenario_path])
+        n = self.scenario_n_frames[scenario_path]
         valid_start = PAST_STEPS
         valid_end   = n - FUTURE_STEPS  # exclusive
         chunk = (anchor_idx - valid_start) * self._VIZ_CHUNKS // (valid_end - valid_start)
@@ -165,7 +173,8 @@ class Bench2DriveDataset(Dataset):
         return f"{scenario_path.name}_part{chunk}"
 
     def _load_anno(self, scenario_path: Path, frame_idx: int) -> dict:
-        return self.anno_cache[scenario_path][frame_idx]
+        f = self.anno_files[scenario_path][frame_idx]
+        return _load_anno_cached(str(f))
 
     def _load_depth_label(self, scenario_path: Path, cam_suffix: str, frame_idx: int) -> torch.Tensor:
         """Load depth label as float32 tensor (1, H, W).
@@ -212,38 +221,40 @@ class Bench2DriveDataset(Dataset):
         return tensor
 
     def __getitem__(self, idx: int) -> dict:
+        for offset in range(len(self)):
+            try:
+                return self._load_sample((idx + offset) % len(self))
+            except Exception:
+                continue
+        raise RuntimeError("No valid samples found in dataset")
+
+    def _load_sample(self, idx: int) -> dict:
         scenario_path, anchor_idx = self.samples[idx]
 
+        # Load each unique frame's annotation exactly once for the full window.
+        all_indices = list(range(anchor_idx - PAST_STEPS, anchor_idx + FUTURE_STEPS + 1))
+        frame_cache: dict = {}
+        for i in all_indices:
+            anno = self._load_anno(scenario_path, i)
+            if anno is None:
+                raise ValueError(f"corrupt annotation at frame {i}")
+            frame_cache[i] = anno
+
         # ── anchor frame (current timestep) ──────────────────────────────────
-        anchor = self._load_anno(scenario_path, anchor_idx)
+        anchor = frame_cache[anchor_idx]
         x0, y0, theta0 = anchor["x"], anchor["y"], anchor["theta"]
 
         # Guard: a small number of frames have theta=nan (CARLA recording artefact).
-        # theta is the anchor heading used to rotate all waypoints into ego frame —
-        # there is no meaningful fallback, so skip to the next sample instead.
         if not math.isfinite(theta0):
-            return self[(idx + 1) % len(self)]
+            raise ValueError("non-finite theta")
 
         # ── past trajectory (indices anchor-PAST_STEPS .. anchor, inclusive) ─
-        past_world = np.array(
-            [[self._load_anno(scenario_path, i)["x"],
-              self._load_anno(scenario_path, i)["y"]]
-             for i in range(anchor_idx - PAST_STEPS, anchor_idx + 1)],
-            dtype=np.float32,
-        )  # (PAST_STEPS+1, 2)
+        past_frames = [frame_cache[i] for i in range(anchor_idx - PAST_STEPS, anchor_idx + 1)]
+        past_world = np.array([[f["x"], f["y"]] for f in past_frames], dtype=np.float32)
         past_traj_ego = world_to_ego(past_world, x0, y0, theta0).astype(np.float32)
 
-        speeds = np.array(
-            [self._load_anno(scenario_path, i)["speed"]
-             for i in range(anchor_idx - PAST_STEPS, anchor_idx + 1)],
-            dtype=np.float32,
-        )  # (PAST_STEPS+1,)
-
-        accels = np.array(
-            [self._load_anno(scenario_path, i)["acceleration"]
-             for i in range(anchor_idx - PAST_STEPS, anchor_idx + 1)],
-            dtype=np.float32,
-        )  # (PAST_STEPS+1, 3)
+        speeds = np.array([f["speed"] for f in past_frames], dtype=np.float32)
+        accels = np.array([f["acceleration"] for f in past_frames], dtype=np.float32)
 
         # ── navigation command (from anchor frame) ────────────────────────────
         raw_cmd = anchor["command_near"]
@@ -251,8 +262,7 @@ class Bench2DriveDataset(Dataset):
 
         # ── future trajectory (indices anchor+1 .. anchor+FUTURE_STEPS) ───────
         future_world = np.array(
-            [[self._load_anno(scenario_path, i)["x"],
-              self._load_anno(scenario_path, i)["y"]]
+            [[frame_cache[i]["x"], frame_cache[i]["y"]]
              for i in range(anchor_idx + 1, anchor_idx + FUTURE_STEPS + 1)],
             dtype=np.float32,
         )  # (FUTURE_STEPS, 2)
