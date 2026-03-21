@@ -1,6 +1,6 @@
 # ResNet-18 front-camera planner (trainable backbone)
 #
-# Best checkpoint: resnet18_trainable_frontcam-epoch=012-val/avg_l2=1.8300.ckpt
+# Best checkpoint: resnet18_trainable_frontcam-epoch=017-val/avg_l2=1.8000.ckpt
 # Trained with: python train.py --model resnet --resnet_variant resnet18 --trainable_backbone
 
 model:
@@ -13,7 +13,7 @@ model:
   backbone: resnet18
   frozen_backbone: false
 
-ckpt_path: /home/farm/Documents/Projects/drive_e2e/checkpoints/resnet18_trainable_frontcam-epoch=012-val/avg_l2=1.8300.ckpt
+ckpt_path: /home/farm/Documents/Projects/drive_e2e/checkpoints/resnet18_trainable_frontcam-epoch=017-val/avg_l2=1.8000.ckpt
 
 device: cuda
 

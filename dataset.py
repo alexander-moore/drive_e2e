@@ -30,6 +30,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
+import torchvision.transforms.v2 as T2
 
 # ImageNet normalisation constants (used by all pretrained torchvision backbones)
 _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -103,6 +104,9 @@ class Bench2DriveDataset(Dataset):
         load_depth: bool = False,
         load_semantic: bool = False,
         front_cam_only: bool = False,
+        n_img_frames: int = 1,
+        img_lambda: float = 3.0,
+        augment: bool = False,
     ):
         self.root = Path(root)
         self.image_size = image_size
@@ -113,6 +117,11 @@ class Bench2DriveDataset(Dataset):
         self.load_semantic = load_semantic
         self.front_cam_only = front_cam_only
         self._cameras = ["rgb_front"] if front_cam_only else CAMERAS
+        self.n_img_frames = n_img_frames
+        self.img_lambda = img_lambda
+        self.augment = augment
+        if augment:
+            self._augmix = T2.AugMix(severity=1)
 
         if scenarios is None:
             scenarios = sorted(
@@ -194,6 +203,8 @@ class Bench2DriveDataset(Dataset):
         if self.image_size is not None:
             img = img.resize((self.image_size[1], self.image_size[0]), Image.BILINEAR)
         tensor = TF.to_tensor(img)  # (3, H, W), float32 in [0, 1]
+        if self.augment:
+            tensor = self._augmix(tensor)
         if self.normalize:
             tensor = (tensor - _IMAGENET_MEAN) / _IMAGENET_STD
         if self.transform is not None:
@@ -267,13 +278,21 @@ class Bench2DriveDataset(Dataset):
 
         # ── camera images ─────────────────────────────────────────────────────
         if self.load_images:
-            # Load only anchor frame images (cheapest baseline)
-            # Shape: (C, 3, H, W) where C=1 if front_cam_only else 6
+            # Exponentially-weighted sampling of past frames (distance=0 is anchor/present)
+            distances = np.arange(PAST_STEPS_TOTAL)                          # [0, 1, ..., 40]
+            weights   = np.exp(-self.img_lambda * distances / PAST_STEPS)
+            weights  /= weights.sum()
+            sampled_d = np.sort(
+                np.random.choice(PAST_STEPS_TOTAL, size=self.n_img_frames, replace=False, p=weights)
+            )  # sorted ascending (oldest→newest), shape (n_img_frames,)
+
             imgs = torch.stack([
-                self._load_image(scenario_path, cam, anchor_idx)
-                for cam in self._cameras
-            ])
+                torch.stack([self._load_image(scenario_path, cam, anchor_idx - int(d))
+                             for cam in self._cameras])
+                for d in sampled_d
+            ])  # (n_img_frames, C, 3, H, W)
             sample["images"] = imgs
+            sample["img_frame_positions"] = torch.tensor(sampled_d, dtype=torch.long)
 
         if self.load_depth:
             depth_imgs = []
@@ -311,13 +330,17 @@ BENCH2DRIVE_MINI_SCENARIOS = [
 ]
 
 
-def make_datasets(root: str, val_scenarios: Optional[List[str]] = None, **kwargs):
+def make_datasets(root: str, val_scenarios: Optional[List[str]] = None,
+                  train_augment: bool = False, **kwargs):
     """
     Split bench2drive into train/val datasets.
 
     By default uses the Bench2Drive-mini scenarios as validation. Any mini
     scenario present in the dataset root is used for val and excluded from
     training; mini scenarios not present are simply skipped.
+
+    Args:
+        train_augment: if True, apply AugMix augmentation to the training set only.
     """
     all_scenarios = sorted(
         d.name for d in Path(root).iterdir()
@@ -327,8 +350,8 @@ def make_datasets(root: str, val_scenarios: Optional[List[str]] = None, **kwargs
         val_scenarios = [s for s in BENCH2DRIVE_MINI_SCENARIOS if s in all_scenarios]
     train_scenarios = [s for s in all_scenarios if s not in val_scenarios]
 
-    train_ds = Bench2DriveDataset(root, scenarios=train_scenarios, **kwargs)
-    val_ds = Bench2DriveDataset(root, scenarios=val_scenarios, **kwargs)
+    train_ds = Bench2DriveDataset(root, scenarios=train_scenarios, augment=train_augment, **kwargs)
+    val_ds   = Bench2DriveDataset(root, scenarios=val_scenarios,   augment=False,         **kwargs)
     return train_ds, val_ds
 
 

@@ -98,6 +98,20 @@ def build_model(args):
             frozen=not args.trainable_backbone,
             debug=args.debug,
         )
+    elif args.model == "multicam_video_resnet":
+        from models.multicam_video_resnet import MulticamVideoResNet
+        return MulticamVideoResNet(
+            token_dim=args.token_dim,
+            num_heads=args.nhead,
+            enc_layers=args.enc_layers,
+            dec_layers=args.dec_layers,
+            multiscale=args.multiscale,
+            backbone=args.resnet_variant,
+            frozen=not args.trainable_backbone,
+            n_img_frames=args.n_img_frames,
+            n_cameras=6,
+            debug=args.debug,
+        )
     else:
         raise ValueError(f"Unknown model: {args.model!r}. "
                          f"Add it to the registry in train_e2e.py.")
@@ -135,10 +149,22 @@ def build_dataloaders(args):
             load_semantic=False,
             front_cam_only=True,
         )
+    elif args.model == "multicam_video_resnet":
+        ds_kwargs = dict(
+            load_images=True,
+            image_size=(224, 224),
+            normalize=True,
+            load_depth=False,
+            load_semantic=False,
+            front_cam_only=False,
+            n_img_frames=args.n_img_frames,
+            img_lambda=3.0,
+        )
     else:
         ds_kwargs = dict(load_images=False, image_size=None)
 
-    train_ds, _inner_val = make_datasets(root=args.data_root, **ds_kwargs)
+    train_augment = args.model == "multicam_video_resnet"
+    train_ds, _inner_val = make_datasets(root=args.data_root, train_augment=train_augment, **ds_kwargs)
 
     val_root = args.val_data_root or args.data_root
     if val_root != args.data_root:
@@ -188,7 +214,8 @@ def main():
 
     # Model
     parser.add_argument("--model",       default="mlp",
-                        choices=["mlp", "transformer", "vision_transformer", "front_cam", "front_cam_depth", "resnet"],
+                        choices=["mlp", "transformer", "vision_transformer", "front_cam",
+                                 "front_cam_depth", "resnet", "multicam_video_resnet"],
                         help="Model architecture to train")
     parser.add_argument("--hidden_dim",  type=int, default=256,
                         help="[mlp] hidden layer width")
@@ -224,6 +251,8 @@ def main():
                         help="[resnet] which ResNet variant to use as backbone")
     parser.add_argument("--trainable_backbone", action="store_true", default=False,
                         help="[resnet] unfreeze backbone weights during training")
+    parser.add_argument("--n_img_frames", type=int, default=8,
+                        help="[multicam_video_resnet] number of past frames to sample per sample")
 
     # Debug
     parser.add_argument("--name", default=None,
@@ -248,9 +277,9 @@ def main():
                         choices=["32", "16-mixed", "bf16-mixed"])
 
     # Logging / checkpointing
-    parser.add_argument("--log_dir",     default="/workspace/e2e/logs",
+    parser.add_argument("--log_dir",     default="logs",
                         help="TensorBoard log root")
-    parser.add_argument("--ckpt_dir",    default="/workspace/e2e/checkpoints",
+    parser.add_argument("--ckpt_dir",    default="checkpoints",
                         help="Checkpoint output directory")
     parser.add_argument("--ckpt_path",   default=None,
                         help="Resume training from this checkpoint")
