@@ -60,6 +60,7 @@ ARCHITECTURE  (multiscale=False default, token_dim D=128, backbone=resnet50)
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as cp
 from torch import Tensor
 import torchvision.models as tv_models
 
@@ -101,7 +102,8 @@ class ResNetEncoder(nn.Module):
     Channel sizes depend on variant — see _BACKBONES table above.
     """
 
-    def __init__(self, variant: str = "resnet50", frozen: bool = True):
+    def __init__(self, variant: str = "resnet50", frozen: bool = True,
+                 grad_checkpoint: bool = False):
         super().__init__()
         if variant not in _BACKBONES:
             raise ValueError(f"Unknown ResNet variant {variant!r}. "
@@ -115,16 +117,25 @@ class ResNetEncoder(nn.Module):
         self.layer3 = backbone.layer3
         self.layer4 = backbone.layer4
         self.frozen = frozen
+        # Gradient checkpointing recomputes activations during backward to save
+        # VRAM; only useful (and valid) when the backbone is trainable.
+        self.grad_checkpoint = grad_checkpoint and not frozen
         if frozen:
             for p in self.parameters():
                 p.requires_grad_(False)
 
     def forward(self, x: Tensor):
-        x  = self.stem(x)
-        s0 = self.layer1(x)
-        s1 = self.layer2(s0)
-        s2 = self.layer3(s1)
-        s3 = self.layer4(s2)
+        x = self.stem(x)
+        if self.grad_checkpoint:
+            s0 = cp.checkpoint(self.layer1, x,  use_reentrant=False)
+            s1 = cp.checkpoint(self.layer2, s0, use_reentrant=False)
+            s2 = cp.checkpoint(self.layer3, s1, use_reentrant=False)
+            s3 = cp.checkpoint(self.layer4, s2, use_reentrant=False)
+        else:
+            s0 = self.layer1(x)
+            s1 = self.layer2(s0)
+            s2 = self.layer3(s1)
+            s3 = self.layer4(s2)
         return s0, s1, s2, s3
 
 
@@ -214,8 +225,7 @@ class ResNetPlanner(nn.Module):
         Run the ResNet backbone on (B, 3, 224, 224) and project each scale to D.
         Returns list of (B, N_k, D) tensors, one per vis level.
         """
-        ctx = torch.no_grad() if self.frozen else torch.enable_grad()
-        with ctx:
+        with torch.set_grad_enabled(not self.frozen):
             s0, s1, s2, s3 = self.encoder(img)
 
         all_feats = [s0, s1, s2, s3] if self.multiscale else [s3]

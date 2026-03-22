@@ -106,6 +106,7 @@ class MulticamVideoResNet(nn.Module):
         multiscale: bool = True,
         backbone: str = "resnet18",
         frozen: bool = False,
+        grad_checkpoint: bool = False,
         n_img_frames: int = 8,
         n_cameras: int = 6,
         debug: bool = False,
@@ -121,7 +122,8 @@ class MulticamVideoResNet(nn.Module):
         ffn_dim = ffn_dim or D * 4
 
         # ── ResNet backbone ───────────────────────────────────────────────────
-        self.encoder = ResNetEncoder(variant=backbone, frozen=frozen)
+        self.encoder = ResNetEncoder(variant=backbone, frozen=frozen,
+                                     grad_checkpoint=grad_checkpoint)
         all_chans = self.encoder.out_channels   # [C1, C2, C3, C4]
 
         # ── Visual scale configuration ────────────────────────────────────────
@@ -178,8 +180,7 @@ class MulticamVideoResNet(nn.Module):
 
         # Flatten all frames and cameras for a single batched backbone pass
         flat = imgs.reshape(B * N_f * C, 3, *imgs.shape[-2:])
-        ctx = torch.no_grad() if self.frozen else torch.enable_grad()
-        with ctx:
+        with torch.set_grad_enabled(not self.frozen):
             s0, s1, s2, s3 = self.encoder(flat)
 
         all_feats = [s0, s1, s2, s3] if self.multiscale else [s3]

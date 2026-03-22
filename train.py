@@ -108,6 +108,7 @@ def build_model(args):
             multiscale=args.multiscale,
             backbone=args.resnet_variant,
             frozen=not args.trainable_backbone,
+            grad_checkpoint=args.grad_checkpoint,
             n_img_frames=args.n_img_frames,
             n_cameras=6,
             debug=args.debug,
@@ -253,6 +254,11 @@ def main():
                         help="[resnet] unfreeze backbone weights during training")
     parser.add_argument("--n_img_frames", type=int, default=8,
                         help="[multicam_video_resnet] number of past frames to sample per sample")
+    parser.add_argument("--grad_checkpoint", action="store_true", default=False,
+                        help="[resnet] enable gradient checkpointing on ResNet layers. "
+                             "Recomputes activations during backward to cut VRAM by ~60%% "
+                             "at ~30%% compute cost. Only applies when --trainable_backbone "
+                             "is set; ignored for frozen backbones.")
 
     # Debug
     parser.add_argument("--name", default=None,
@@ -275,6 +281,17 @@ def main():
     parser.add_argument("--devices",     type=int, default=1)
     parser.add_argument("--precision",   default="32",
                         choices=["32", "16-mixed", "bf16-mixed"])
+    parser.add_argument("--accumulate_grad_batches", type=int, default=1,
+                        help="Accumulate gradients over N batches before optimizer step. "
+                             "Effective batch = batch_size × devices × N. "
+                             "Use when per-step batch must be small to fit in VRAM.")
+    parser.add_argument("--sync_batchnorm", action="store_true", default=False,
+                        help="Convert all BatchNorm layers to SyncBatchNorm for multi-GPU "
+                             "training. Recommended when --trainable_backbone is set and "
+                             "--devices > 1.")
+    parser.add_argument("--compile", action="store_true", default=False,
+                        help="Wrap model with torch.compile() for ~20%% faster training "
+                             "on Ampere/Hopper/Blackwell GPUs (requires PyTorch 2+).")
 
     # Logging / checkpointing
     parser.add_argument("--log_dir",     default="logs",
@@ -293,6 +310,8 @@ def main():
 
     # ── build components ──────────────────────────────────────────────────
     model = build_model(args)
+    if args.compile:
+        model = torch.compile(model)
     if args.model in ("vision_transformer", "front_cam_depth"):
         module = MultiTaskE2EModule(
             model=model,
@@ -342,6 +361,8 @@ def main():
         log_every_n_steps=1 if args.debug else 500,
         val_check_interval=1.0,
         gradient_clip_val=1.0,
+        accumulate_grad_batches=args.accumulate_grad_batches,
+        sync_batchnorm=args.sync_batchnorm,
     )
 
     n_params = sum(p.numel() for p in model.parameters())
