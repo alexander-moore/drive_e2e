@@ -17,6 +17,12 @@ ckpt_path: /home/farm/Documents/Projects/drive_e2e/checkpoints/resnet18_trainabl
 
 device: cuda
 
+# Inference optimizations (both optional — omit to keep default pytorch/float32 behavior)
+# inference_mode: compile      # torch.compile(); best CUDA option
+# inference_mode: torchscript  # alternative to compile
+# quantization: fp16           # recommended for CUDA — half precision on ResNet + transformer
+# quantization: dynamic        # INT8 Linear quant; requires device: cpu
+
 # Trajectory controller gains
 max_speed:        4.0
 steer_lookahead:  1.0

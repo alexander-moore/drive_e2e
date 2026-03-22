@@ -13,6 +13,12 @@ ckpt_path: /home/farm/Documents/Projects/drive_e2e/checkpoints/mlp-random-weight
 
 device: cuda   # set to "cpu" if no GPU available
 
+# Inference optimizations (both optional — omit to keep default pytorch/float32 behavior)
+# inference_mode: compile      # torch.compile(); best CUDA option
+# inference_mode: torchscript  # alternative to compile
+# quantization: fp16           # recommended for CUDA — half precision
+# quantization: dynamic        # INT8 Linear quant; requires device: cpu
+
 # Trajectory controller gains
 # These are starting values; tune on a 1-route debug run before the full eval.
 max_speed:        6.0    # m/s — MLP tends to predict conservative speeds

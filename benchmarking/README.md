@@ -318,7 +318,48 @@ pkill -f CarlaUE4
 
 ---
 
-## 9 — Key paths (this machine)
+## 9 — Inference latency benchmarks
+
+Run with `benchmarking/latency_benchmark.py` (CARLA-free, measures post-buffer ticks only):
+
+```bash
+conda activate b2d
+cd /home/farm/Documents/Projects/drive_e2e
+python benchmarking/latency_benchmark.py --config agent_configs/resnet18.yaml --ticks 200
+```
+
+### ResNet-18 front-camera planner — CUDA (resnet18, val/avg_l2 = 1.800)
+
+| Configuration | Mean ms/tick | Std | Speedup vs pytorch/float32 | Status |
+|---|---|---|---|---|
+| pytorch / float32 | 52.12 | ±2.78 | 1.00× (baseline) | ✓ active |
+| compile / float32 | 51.61 | ±2.67 | 1.01× | ⚠ fell back — no C compiler in b2d env |
+| compile / bf16 ★ | 52.31 | ±3.98 | 1.00× | ⚠ fell back — bf16 dtype mismatch + no C compiler |
+| compile / fp16 | 52.18 | ±3.20 | 1.00× | ⚠ fell back — fp16 dtype mismatch + no C compiler |
+| torchscript / float32 | 51.68 | ±2.42 | 1.01× | ⚠ fell back — TorchScript graph nondeterminism |
+| torchscript / bf16 | 52.09 | ±2.85 | 1.00× | ⚠ fell back — bf16 dtype mismatch |
+
+All configs fell back to eager float32 in the `b2d` conda env. Two environment issues:
+
+1. **`torch.compile` needs a C compiler** — fix with:
+   ```bash
+   conda activate b2d && conda install -c conda-forge gxx_linux-64
+   # or: sudo apt install gcc g++
+   ```
+
+2. **fp16/bf16 dtype mismatch in ResNet backbone** — some tensors in the backbone
+   are not being cast by `model.to(dtype)`. Needs investigation; likely unregistered
+   buffers in the pretrained torchvision ResNet. The fallback to float32 is working
+   correctly — no crashes.
+
+> **Note:** The `compile` + `bf16` speedups (expected ~1.5–2×) will show up once gcc
+> is installed and the dtype issue is resolved. Rerun `latency_benchmark.py` to
+> confirm and update this table.
+
+---
+
+## 10 — Key paths (this machine)
+
 
 | Resource | Path |
 |----------|------|

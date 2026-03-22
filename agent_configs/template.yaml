@@ -50,6 +50,25 @@ ckpt_path: /workspace/e2e/checkpoints/last.ckpt
 device: cuda    # cuda | cpu
 
 # ─────────────────────────────────────────────────
+# INFERENCE OPTIMIZATIONS
+# ─────────────────────────────────────────────────
+# Default (when omitted): compile + bf16 with automatic fallback.
+# The agent will print exactly what is active at startup.
+#
+# inference_mode: compile      # DEFAULT — torch.compile(), best for CUDA (PyTorch 2.0+)
+# inference_mode: torchscript  # torch.jit.trace + optimize_for_inference
+# inference_mode: pytorch      # eager mode, no graph optimization
+#
+# quantization: bf16           # DEFAULT — bfloat16, recommended for Ampere+ (RTX 30/40xx, A100)
+# quantization: fp16           # float16, for older CUDA GPUs (Turing/Volta)
+# quantization: none           # float32, no precision change
+# quantization: dynamic        # INT8 Linear quant — CPU only, requires device: cpu
+#
+# Fallback behaviour (automatic, no config needed):
+#   bf16 fails → tries fp16 → falls back to float32
+#   compile fails → falls back to eager PyTorch
+
+# ─────────────────────────────────────────────────
 # CONTROL PARAMETERS
 # ─────────────────────────────────────────────────
 max_speed:       8.0     # m/s — absolute speed cap sent to controller

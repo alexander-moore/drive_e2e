@@ -255,6 +255,167 @@ def _build_model_from_cfg(cfg: dict) -> nn.Module:
         )
 
 
+def _make_example_batch(needs_images: bool, device: torch.device) -> dict:
+    """Build a minimal dummy batch for TorchScript tracing (batch size 1)."""
+    batch = {
+        "past_traj":    torch.zeros(1, PAST_STEPS_TOTAL, 2, device=device),
+        "speed":        torch.zeros(1, PAST_STEPS_TOTAL, device=device),
+        "acceleration": torch.zeros(1, PAST_STEPS_TOTAL, 3, device=device),
+        "command":      torch.zeros(1, dtype=torch.long, device=device),
+    }
+    if needs_images:
+        batch["images"] = torch.zeros(1, 1, 3, IMAGE_H, IMAGE_W, device=device)
+    return batch
+
+
+def _try_forward(model: nn.Module, needs_images: bool,
+                 device: torch.device, dtype: torch.dtype) -> Optional[Exception]:
+    """
+    Run a single dummy forward pass to validate a model configuration.
+    Returns None on success, or the Exception on failure.
+    This catches errors that only surface at runtime (e.g. ops unsupported
+    in bf16 on older GPUs, or torch.compile graph breaks).
+    """
+    example = _make_example_batch(needs_images, device)
+    if dtype != torch.float32:
+        example = {
+            k: v.to(dtype) if v.is_floating_point() else v
+            for k, v in example.items()
+        }
+    try:
+        with torch.no_grad():
+            model(example)
+        return None
+    except Exception as exc:
+        return exc
+
+
+def _optimize_model(
+    model: nn.Module,
+    needs_images: bool,
+    device: torch.device,
+    inference_mode: str,
+    quantization: str,
+) -> Tuple[nn.Module, torch.dtype]:
+    """
+    Apply optional precision casting and graph compilation.
+
+    Called once during setup() after weights are loaded and model is in eval().
+    Runs a warmup forward pass after each step to catch runtime failures early
+    (e.g. ops unsupported in bf16, torch.compile graph breaks) and falls back
+    gracefully, printing exactly what is active so the user always knows.
+
+    Returns (model, inference_dtype). The dtype is used in run_step to cast
+    input batches before each forward pass.
+
+    Default: inference_mode="compile", quantization="bf16"
+
+    inference_mode : "compile"     — torch.compile() — default, best for CUDA
+                     "torchscript" — torch.jit.trace + optimize_for_inference
+                     "pytorch"     — eager mode, no graph optimization
+
+    quantization   : "bf16"    — bfloat16 (default; Ampere+ GPUs recommended)
+                     "fp16"    — float16 (older CUDA GPUs)
+                     "none"    — float32, no precision change
+                     "dynamic" — INT8 dynamic quant on Linear layers (CPU only)
+    """
+    _TAG = "[E2EBench2DriveAgent]"
+    dtype = torch.float32
+
+    # ── Step 1: Precision ────────────────────────────────────────────────
+    if quantization in ("bf16", "fp16"):
+        target_dtype = torch.bfloat16 if quantization == "bf16" else torch.float16
+        if device.type != "cuda":
+            print(f"{_TAG} NOTE: {quantization} works best on CUDA; on CPU it may be slower than float32.")
+
+        print(f"{_TAG} Trying {quantization} precision...")
+        candidate = model.to(target_dtype)
+        err = _try_forward(candidate, needs_images, device, target_dtype)
+        if err is None:
+            model, dtype = candidate, target_dtype
+            print(f"{_TAG} {quantization} active — model weights and inputs cast to {target_dtype}.")
+        else:
+            # bf16 failed (common on pre-Ampere GPUs) → try fp16 before giving up
+            model = model.to(torch.float32)   # restore
+            if quantization == "bf16":
+                print(f"{_TAG} WARNING: bf16 failed ({err}). Trying fp16 fallback...")
+                candidate = model.to(torch.float16)
+                err2 = _try_forward(candidate, needs_images, device, torch.float16)
+                if err2 is None:
+                    model, dtype = candidate, torch.float16
+                    print(f"{_TAG} fp16 active (bf16 was unsupported on this GPU).")
+                else:
+                    model = model.to(torch.float32)
+                    print(f"{_TAG} WARNING: fp16 also failed ({err2}). Running float32.")
+            else:
+                print(f"{_TAG} WARNING: fp16 failed ({err}). Running float32.")
+
+    elif quantization == "dynamic":
+        if device.type != "cpu":
+            print(
+                f"{_TAG} WARNING: dynamic INT8 quantization requires CPU but device is CUDA. "
+                "Use quantization: bf16 or fp16 for CUDA. Skipping."
+            )
+        else:
+            print(f"{_TAG} Applying dynamic INT8 quantization (Linear layers)...")
+            model = torch.quantization.quantize_dynamic(
+                model, {nn.Linear}, dtype=torch.qint8
+            )
+            print(f"{_TAG} Dynamic INT8 quantization active.")
+
+    elif quantization not in ("none", ""):
+        print(f"{_TAG} WARNING: unknown quantization={quantization!r}; running float32.")
+
+    # ── Step 2: Graph compilation ─────────────────────────────────────────
+    if inference_mode == "compile":
+        print(f"{_TAG} Trying torch.compile()...")
+        try:
+            compiled = torch.compile(model)
+            # Warmup triggers the actual compilation and catches graph-break errors
+            err = _try_forward(compiled, needs_images, device, dtype)
+            if err is None:
+                model = compiled
+                print(f"{_TAG} torch.compile() active (warmup pass completed).")
+            else:
+                print(
+                    f"{_TAG} WARNING: torch.compile() warmup failed ({err}). "
+                    "Falling back to eager PyTorch."
+                )
+        except Exception as exc:
+            print(f"{_TAG} WARNING: torch.compile() failed ({exc}). Falling back to eager PyTorch.")
+
+    elif inference_mode == "torchscript":
+        print(f"{_TAG} Trying TorchScript trace...")
+        example_batch = _make_example_batch(needs_images, device)
+        if dtype != torch.float32:
+            example_batch = {
+                k: v.to(dtype) if v.is_floating_point() else v
+                for k, v in example_batch.items()
+            }
+        try:
+            scripted = torch.jit.trace(model, example_inputs=(example_batch,))
+            scripted = torch.jit.optimize_for_inference(scripted)
+            print(f"{_TAG} TorchScript trace + optimize_for_inference active.")
+            return scripted, dtype
+        except Exception as exc:
+            print(
+                f"{_TAG} WARNING: TorchScript tracing failed ({exc}). "
+                "Falling back to eager PyTorch."
+            )
+
+    elif inference_mode not in ("pytorch", ""):
+        print(f"{_TAG} WARNING: unknown inference_mode={inference_mode!r}; using eager PyTorch.")
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    mode_label = "torch.compile" if inference_mode == "compile" else inference_mode
+    print(
+        f"{_TAG} Inference ready — "
+        f"mode={mode_label}  precision={dtype}  device={device}"
+    )
+
+    return model, dtype
+
+
 def _load_weights_from_lightning_ckpt(model: nn.Module, ckpt_path: str,
                                       device: torch.device) -> nn.Module:
     """
@@ -456,7 +617,12 @@ class E2EBench2DriveAgent(_AGENT_BASE):
         model = _load_weights_from_lightning_ckpt(
             model, cfg["ckpt_path"], self._device
         )
-        self._model = model
+
+        inference_mode = cfg.get("inference_mode", "compile")
+        quantization   = cfg.get("quantization",   "bf16")
+        self._model, self._inference_dtype = _optimize_model(
+            model, self._needs_images, self._device, inference_mode, quantization
+        )
 
         # ── Controller ────────────────────────────────────────────────────
         self._controller = TrajectoryController(
@@ -499,6 +665,7 @@ class E2EBench2DriveAgent(_AGENT_BASE):
         print(f"[E2EBench2DriveAgent] model={model_type}  "
               f"ckpt={cfg['ckpt_path']}  device={device_str}  "
               f"vision={self._needs_images}  "
+              f"inference={inference_mode}  quantization={quantization}  "
               f"frame_dir={self._frame_dir}")
 
     # ── Sensor list ───────────────────────────────────────────────────────
@@ -661,6 +828,11 @@ class E2EBench2DriveAgent(_AGENT_BASE):
             batch["images"] = preprocess_image(rgba, self._device)
 
         # ── Inference ──────────────────────────────────────────────────────
+        if self._inference_dtype != torch.float32:
+            batch = {
+                k: v.to(self._inference_dtype) if v.is_floating_point() else v
+                for k, v in batch.items()
+            }
         raw_output = self._model(batch)
 
         # Handle dict output (MultiTask models return {"future_traj": ..., ...})
